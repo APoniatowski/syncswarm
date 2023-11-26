@@ -1,0 +1,3 @@
+# syncswarm
+
+Effortless, Real-Time Data Replication Across Networks. SyncSwarm is a cutting-edge Golang library designed for seamless and efficient distributed data synchronization. With its intuitive auto-discovery mechanism and robust encryption key sharing, it ensures data - be it files, variables, or structures - is replicated swiftly and securely across networked machines. Ideal for systems requiring minimal setup, SyncSwarm prioritizes replication based on proximity, optimizing resource usage and performance akin to torrent systems, but with zero dependencies except the 'net' package
