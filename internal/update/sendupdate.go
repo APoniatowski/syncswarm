@@ -5,16 +5,15 @@ import (
 	"net"
 	"strconv"
 	"sync"
-	"time"
 )
 
-func (networkupdate *NetworkUpdateData) SendUpdate() error {
+func (networkUpdate *NetworkUpdateData) SendUpdate(key *string) error {
 	var waitGroup sync.WaitGroup
 	var encryptedData []byte
 	var err error
 	waitGroup.Add(1)
 	go func() {
-		encryptedData, err = networkupdate.EncryptUpdateData()
+		encryptedData, err = networkUpdate.encryptUpdateData([]byte(*key))
 		waitGroup.Done()
 	}()
 	if err != nil {
@@ -22,7 +21,10 @@ func (networkupdate *NetworkUpdateData) SendUpdate() error {
 	}
 	waitGroup.Wait()
 	errMap := make(map[string]error)
-	for _, node := range networkupdate.Nodes {
+	for _, node := range networkUpdate.Nodes {
+		if node == networkUpdate.Originator {
+			continue
+		}
 		nodeAddr, err := net.ResolveUDPAddr("udp", node+":"+strconv.Itoa(udpPort))
 		if err != nil {
 			return err
@@ -50,35 +52,4 @@ func (networkupdate *NetworkUpdateData) SendUpdate() error {
 		}
 	}
 	return nil
-}
-
-func (data NetworkUpdateData) EncryptUpdateData() ([]byte, error) {
-	var encryptedUpdate []byte
-	// encrypt the new network data and convert to bytes using the PreSharedKey
-	return encryptedUpdate, nil
-}
-
-func sendConfirmation(conn *net.UDPConn) bool {
-	var result bool
-	for index, request := range confirmationRequests {
-		_, err := conn.Write([]byte(request))
-		if err != nil {
-			return false
-		}
-		deadline := time.Now().Add(200 * time.Millisecond)
-		err = conn.SetReadDeadline(deadline)
-		if err != nil {
-			return false
-		}
-		buffer := make([]byte, 1024)
-		n, _, err := conn.ReadFromUDP(buffer)
-		if err != nil {
-			return false
-		}
-		if string(buffer[:n]) == expectedResponses[index] {
-			result = true
-		}
-	}
-
-	return result
 }

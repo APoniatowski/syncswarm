@@ -1,10 +1,11 @@
 package internal
 
 type CurrentData struct {
-	Nodes        []string
-	Originator   string
-	Hostname     string
-	PubKey       string
-	PrivKey      string
-	PreSharedKey string
+	Nodes        *[]string
+	Progenitor   *string
+	Successor    *string
+	Hostname     *string
+	PubKey       *string
+	PrivKey      *string
+	PreSharedKey *string
 }

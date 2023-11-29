@@ -4,6 +4,8 @@ import (
 	"log"
 	"os"
 	"sync"
+
+	"github.com/APoniatowski/syncswarm/internal"
 )
 
 func init() {
@@ -25,7 +27,9 @@ func StartUpdates() int {
 		NewPrivKey: "",
 	}
 	waitgroup.Wait()
-	err = prepUpdate.SendUpdate()
+	var currentData internal.CurrentData
+	// populate data here
+	err = prepUpdate.SendUpdate(currentData.PreSharedKey)
 	if err != nil {
 		log.Fatalln(err)
 		return 2
