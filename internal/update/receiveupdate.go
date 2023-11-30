@@ -6,12 +6,12 @@ import (
 	"strconv"
 )
 
-func (networkUpdate *NetworkUpdateData) ReceiveUpdate() error {
+func (networkUpdate *NetworkUpdateData) ReceiveUpdate(key *string) error {
 	listenAddr, _ := net.ResolveUDPAddr("udp", strconv.Itoa(udpPort))
 	conn, _ := net.ListenUDP("udp", listenAddr)
 	defer conn.Close()
 
-	buffer := make([]byte, 1024)
+	buffer := make([]byte, 32)
 	n, _, _ := conn.ReadFromUDP(buffer)
 
 	var receivedData NetworkUpdateData

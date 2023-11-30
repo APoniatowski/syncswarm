@@ -9,10 +9,16 @@ import (
 )
 
 func init() {
-	// Run discovery checks and get any info:w
+	// Run discovery checks and get any info
 }
 
-func StartUpdates() int {
+func UpdatePayload(payload UpdateService) *NewUpdate {
+	return &NewUpdate{
+		NewPayload: payload,
+	}
+}
+
+func (payload *NewUpdate) StartUpdates() int {
 	var waitgroup sync.WaitGroup
 	go newKeys(&waitgroup)
 	hostname, err := os.Hostname()
@@ -20,7 +26,8 @@ func StartUpdates() int {
 		log.Fatalln(err)
 		return 1
 	}
-	prepUpdate := NetworkUpdateData{
+	// partial dummy data
+	payload.NetworkUpdateData = NetworkUpdateData{
 		Nodes:      []string{"node1", "node2"},
 		Originator: hostname,
 		NewPubKey:  "",
@@ -29,7 +36,7 @@ func StartUpdates() int {
 	waitgroup.Wait()
 	var currentData internal.CurrentData
 	// populate data here
-	err = prepUpdate.SendUpdate(currentData.PreSharedKey)
+	err = payload.NetworkUpdateData.SendUpdate(currentData.PreSharedKey)
 	if err != nil {
 		log.Fatalln(err)
 		return 2
