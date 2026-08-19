@@ -1,0 +1,26 @@
+# Run a SyncSwarm relay with Docker Compose.
+#   docker compose -f relay/docker-compose.yml up --build -d
+#
+# The build context is the SDK repo root (the relay is part of that module).
+services:
+  relay:
+    build:
+      context: ..
+      dockerfile: relay/Dockerfile
+    image: syncswarm-relay:latest
+    container_name: syncswarm-relay
+    restart: unless-stopped
+    ports:
+      - "64512:64512/udp" # discovery
+      - "64513:64513/tcp" # data transfer
+      - "127.0.0.1:8080:8080/tcp" # health/metrics — bound to localhost by default
+    volumes:
+      - relay-data:/data
+    environment:
+      SYNCSWARM_STORE_FORWARD: "true"
+      SYNCSWARM_RELAY_SCORING: "true"
+      # Join an existing swarm by listing a few known peers:
+      # SYNCSWARM_BOOTSTRAP: "relay1.example.com:64512,relay2.example.com:64512"
+
+volumes:
+  relay-data:

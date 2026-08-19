@@ -10,7 +10,7 @@ import (
 func newKeys(waitgroup *sync.WaitGroup) int {
 	waitgroup.Add(1)
 	defer waitgroup.Done()
-	err := encryption.GenerateKeys(4096)
+	err := encryption.GenerateKeys("/opt/syncswarm/new", 4096)
 	if err != nil {
 		return 1
 	}

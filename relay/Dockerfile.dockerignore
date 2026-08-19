@@ -1,0 +1,16 @@
+# Build-context excludes for the relay image (context = SDK repo root).
+# Keep only what `go build ./relay` needs.
+.git
+.claude
+messenger
+examples
+**/*_test.go
+**/testdata
+relay/relay-data
+relay/README.md
+relay/docker-compose.yml
+*.md
+ROADMAP.md
+THREAT_MODEL.md
+MESSENGER.md
+MESSENGER*.md
