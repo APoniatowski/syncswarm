@@ -5,6 +5,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"strconv"
 	"sync"
@@ -128,6 +129,13 @@ type Discovery struct {
 	// Bootstrap peer addresses (host:port UDP) set via SetBootstrapPeers.
 	bootstrapPeers []string
 
+	// peerCachePath, if set, persists recently-seen peer addresses so a node
+	// re-bootstraps from them across restarts (reducing dependence on the seed).
+	peerCachePath string
+	// bootstrapWarned tracks whether we've already logged that no bootstrap/seed
+	// address resolved, so the warning fires once per outage, not every tick.
+	bootstrapWarned atomic.Bool
+
 	// listenPort is the actual UDP port this instance is bound to (resolved from
 	// the requested port, which may have been 0 for an ephemeral port).
 	listenPort int
@@ -224,6 +232,29 @@ func (d *Discovery) SetRelayIDs(ids []string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.relayIDs = append([]string(nil), ids...)
+}
+
+// SetRelay toggles this node's advertised "relay" capability at runtime and
+// re-advertises (discovery broadcast + announce) so peers learn of the change.
+// This lets a node start relaying once it concludes it is reachable and stop if
+// that changes, without a restart. isTransport() (announce forwarding) follows the
+// same capability, so it flips too.
+func (d *Discovery) SetRelay(on bool) {
+	d.mu.Lock()
+	caps := make([]string, 0, len(d.capabilities)+1)
+	for _, c := range d.capabilities {
+		if c != "relay" {
+			caps = append(caps, c)
+		}
+	}
+	if on {
+		caps = append(caps, "relay")
+	}
+	d.capabilities = caps
+	d.mu.Unlock()
+	// Propagate the change immediately.
+	d.broadcastDiscovery()
+	d.announceSelf()
 }
 
 // recordObserved tallies an external address a peer reported seeing us at.
@@ -426,6 +457,7 @@ func (d *Discovery) initialReachabilityCheck() {
 
 // Stop halts all discovery activities
 func (d *Discovery) Stop() {
+	d.savePeerCache() // flush known peers so the next start re-bootstraps from them
 	d.cancel()
 	for _, i := range d.ifaces {
 		i.Close()
@@ -657,6 +689,7 @@ func (d *Discovery) maintainPeers() {
 		case <-gossipTicker.C:
 			d.gossipPeers()
 			d.refreshDHT()
+			d.savePeerCache() // persist known peers so restarts re-bootstrap from them
 		case <-reachTicker.C:
 			d.reachMu.Lock()
 			enabled := d.reachEnabled
@@ -971,12 +1004,22 @@ func (d *Discovery) sendBootstrapDiscovery() {
 	}
 
 	packetBytes := d.discoveryPacketBytes()
+	resolved := 0
 	for _, a := range addrs {
 		udpAddr, err := net.ResolveUDPAddr("udp", a)
 		if err != nil {
 			continue
 		}
+		resolved++
 		d.iface.Send(udpAddr.String(), packetBytes)
+	}
+	// If not a single bootstrap/seed address resolved, the node can never join
+	// via them (e.g. a seed DNS record that doesn't exist). Warn once so this
+	// otherwise-invisible failure is self-diagnosing.
+	if resolved == 0 && d.bootstrapWarned.CompareAndSwap(false, true) {
+		log.Printf("discovery: none of %d bootstrap/seed addresses resolved (%v) — node cannot join via them; check DNS/config", len(addrs), addrs)
+	} else if resolved > 0 {
+		d.bootstrapWarned.Store(false)
 	}
 }
 

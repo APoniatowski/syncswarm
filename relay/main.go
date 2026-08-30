@@ -29,6 +29,8 @@ func main() {
 	dataPort := flag.Int("data", envInt("SYNCSWARM_DATA_PORT", 64513), "TCP data port")
 	storageDir := flag.String("storage", envStr("SYNCSWARM_STORAGE_DIR", "./relay-data"), "storage directory (node identity + offline queue)")
 	bootstrap := flag.String("boot", envStr("SYNCSWARM_BOOTSTRAP", ""), "comma-separated bootstrap peers (host:discPort)")
+	bridgeListen := flag.String("bridge-listen", envStr("SYNCSWARM_BRIDGE_LISTEN", ""), "TCP address to accept inbound discovery bridges on (e.g. :64514); empty = off")
+	bridge := flag.String("bridge", envStr("SYNCSWARM_BRIDGE", ""), "comma-separated transport nodes to open outbound bridges to (host:bridgePort)")
 	storeForward := flag.Bool("store", envBool("SYNCSWARM_STORE_FORWARD", true), "hold messages for offline recipients")
 	storeTTL := flag.Duration("store-ttl", envDur("SYNCSWARM_STORE_FORWARD_TTL", 0), "how long to hold offline messages (0 = default)")
 	scoring := flag.Bool("scoring", envBool("SYNCSWARM_RELAY_SCORING", true), "challenge peer relays and route around silent droppers")
@@ -45,6 +47,10 @@ func main() {
 	if s := strings.TrimSpace(*bootstrap); s != "" {
 		peers = strings.Split(s, ",")
 	}
+	var bridges []string
+	if s := strings.TrimSpace(*bridge); s != "" {
+		bridges = strings.Split(s, ",")
+	}
 
 	node, err := swarmsync.New(swarmsync.Options{
 		StorageDir:      *storageDir,
@@ -53,6 +59,8 @@ func main() {
 		StoreForwardTTL: *storeTTL,
 		RelayScoring:    *scoring,
 		BootstrapPeers:  peers,
+		BridgePeers:     bridges,
+		BridgeListen:    *bridgeListen,
 		DiscoveryPort:   *discPort,
 		DataPort:        *dataPort,
 		// No content Key and no erasure coding: a relay forwards opaque blobs and

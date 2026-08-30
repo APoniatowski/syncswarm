@@ -20,6 +20,16 @@ import (
 	"github.com/APoniatowski/syncswarm/internal/transfer"
 )
 
+// DefaultSeeds are the baked-in rendezvous addresses a node falls back to when no
+// BootstrapPeers are configured (and DisableDefaultSeeds is not set), so an app
+// can join the network with zero configuration. Use DNS names (not raw IPs) so the
+// underlying hosts can rotate; list several, run by independent operators, so no
+// single seed is load-bearing — that is what makes the network progressively
+// decentralized. Applications may append their own.
+var DefaultSeeds = []string{
+	"seed.postal-studios.com:64512",
+}
+
 // Options configures the SyncSwarm instance
 type Options struct {
 	// Directory where data will be stored (also holds the persistent identity key)
@@ -41,6 +51,10 @@ type Options struct {
 	// BootstrapPeers are host:port UDP addresses of known nodes to contact on
 	// startup, so this node can join a swarm beyond its local broadcast domain.
 	BootstrapPeers []string
+	// DisableDefaultSeeds opts out of the baked-in DefaultSeeds. By default a node
+	// with no BootstrapPeers still tries the default seed(s) so it can join with
+	// zero configuration; set this to rely solely on BootstrapPeers.
+	DisableDefaultSeeds bool
 	// BridgePeers are host:port TCP addresses of known transport nodes to open a
 	// persistent bridge to. Announces and path requests fan out across bridges, so
 	// this node discovers (and is discovered by) peers on networks its UDP
@@ -91,6 +105,11 @@ type Options struct {
 	// reservations regardless. Recommended for clients that may or may not be
 	// behind NAT.
 	AutoRelay bool
+	// OnReachabilityChange, if set, is called with AutoNAT's conclusion whenever it
+	// flips (true = this node is dial-able from outside, false = not). Enables
+	// reachability observation independently of AutoRelay — e.g. to start relaying
+	// only while reachable via SetRelay. Fires from a background goroutine.
+	OnReachabilityChange func(reachable bool)
 	// StrictAnonymity makes an anonymous send (HopCount > 0) fail with an error
 	// when no forwarded route can be built (e.g. no relay is available), instead of
 	// silently degrading to a direct send that would reveal the sender's address to
@@ -330,7 +349,19 @@ func New(opts Options) (*SyncSwarm, error) {
 		capabilities = append(capabilities, "relay")
 	}
 	disc.SetIdentity(nodePub.Bytes(), uint16(trans.Port()), capabilities)
-	disc.SetBootstrapPeers(opts.BootstrapPeers)
+	// Bootstrap set = caller-supplied peers plus the baked-in default seeds
+	// (unless opted out), so a node with no configuration can still join. As the
+	// network grows and nodes cache peers, no single seed stays load-bearing.
+	boot := append([]string(nil), opts.BootstrapPeers...)
+	if !opts.DisableDefaultSeeds {
+		boot = append(boot, DefaultSeeds...)
+	}
+	disc.SetBootstrapPeers(boot)
+	// Persist and reload known peers across restarts, further reducing seed
+	// dependence, when we have a storage directory.
+	if opts.StorageDir != "" {
+		disc.SetPeerCache(filepath.Join(opts.StorageDir, "discovery-peers.json"))
+	}
 	// Accept inbound bridges when configured (transport-node role).
 	if opts.BridgeListen != "" {
 		if _, err := disc.AddListenBridge("bridge-listen", opts.BridgeListen); err != nil {
@@ -356,11 +387,17 @@ func New(opts Options) (*SyncSwarm, error) {
 			trans.SetPostQuantum(true, decap)
 		}
 	}
-	if opts.AutoRelay {
-		// AutoNAT: enable reservations when discovery concludes we're unreachable.
-		// A manually-set NeedsRelay still wins (stays on even if reachable).
+	if opts.AutoRelay || opts.OnReachabilityChange != nil {
+		// AutoNAT: enable reservations when discovery concludes we're unreachable
+		// (a manually-set NeedsRelay still wins), and surface the conclusion to the
+		// app so it can, e.g., start/stop relaying based on reachability.
 		disc.EnableReachabilityChecks(func(reachable bool) {
-			trans.SetNeedsRelay(opts.NeedsRelay || !reachable)
+			if opts.AutoRelay {
+				trans.SetNeedsRelay(opts.NeedsRelay || !reachable)
+			}
+			if opts.OnReachabilityChange != nil {
+				opts.OnReachabilityChange(reachable)
+			}
 		})
 	}
 	trans.SetAnonymity(opts.CoverTraffic, opts.PadCellSize, opts.RelayJitter)
@@ -493,6 +530,21 @@ func (s *SyncSwarm) DiscoveryPort() int {
 // DataPort returns the actual TCP port this node's transfer service is bound to.
 func (s *SyncSwarm) DataPort() int {
 	return s.transfer.Port()
+}
+
+// Reachable reports AutoNAT's conclusion about whether this node is dial-able from
+// outside. known is false until enough dial-back probes have completed (requires
+// AutoRelay or OnReachabilityChange to have enabled reachability checks).
+func (s *SyncSwarm) Reachable() (reachable, known bool) {
+	return s.discovery.Reachable()
+}
+
+// SetRelay turns this node's advertised relay capability on or off at runtime and
+// re-advertises, so a node can start forwarding for others once it learns it is
+// reachable (and stop if that changes). Only advertise relay when reachable — an
+// undialable relay black-holes traffic routed to it.
+func (s *SyncSwarm) SetRelay(on bool) {
+	s.discovery.SetRelay(on)
 }
 
 // SetBootstrapPeers sets the discovery bootstrap peer addresses. Call before

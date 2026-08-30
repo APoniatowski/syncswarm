@@ -56,6 +56,55 @@ GOOS=darwin  GOARCH=arm64 go build -o syncswarm-relay-macos        ./relay
 Run it under systemd, a process supervisor, or in a `screen`/`tmux` session so it
 stays up.
 
+## Run as a systemd service (Ubuntu/Debian)
+
+Keep a relay up across reboots without Docker. Install the binary and drop a unit:
+
+```bash
+sudo install -m 0755 syncswarm-relay /usr/local/bin/
+```
+
+`/etc/systemd/system/syncswarm-relay.service`:
+
+```ini
+[Unit]
+Description=SyncSwarm Relay
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+StateDirectory=syncswarm-relay
+ExecStart=/usr/local/bin/syncswarm-relay \
+  -storage /var/lib/syncswarm-relay \
+  -boot PEER_PUBLIC_IP:64512 \
+  -http 127.0.0.1:8080 -store
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now syncswarm-relay
+systemctl status syncswarm-relay
+journalctl -u syncswarm-relay -f
+```
+
+- `StateDirectory` creates `/var/lib/syncswarm-relay` and **persists the node
+  identity** — keep it so the relay's node ID stays stable across restarts.
+- `DynamicUser=yes` runs it as a sandboxed, throwaway system user (no manual
+  useradd).
+- The health endpoint is bound to **localhost** — monitor it over SSH rather than
+  exposing it. Drop `-boot` entirely on the *first* relay of a brand-new swarm.
+- Open the firewall (below) for UDP `64512` + TCP `64513`.
+
 ## Configuration
 
 Every setting is a flag with an environment-variable fallback, so the same binary
@@ -67,6 +116,8 @@ is convenient on the command line and in a container.
 | `-data` | `SYNCSWARM_DATA_PORT` | `64513` | TCP data-transfer port. |
 | `-storage` | `SYNCSWARM_STORAGE_DIR` | `./relay-data` (`/data` in Docker) | Node identity + offline queue. |
 | `-boot` | `SYNCSWARM_BOOTSTRAP` | – | Comma-separated `host:discPort` peers to join. |
+| `-bridge-listen` | `SYNCSWARM_BRIDGE_LISTEN` | – | TCP address to accept inbound discovery **bridges** on (e.g. `:64514`); lets NAT'd clients bridge discovery through this relay. Empty = off. |
+| `-bridge` | `SYNCSWARM_BRIDGE` | – | Comma-separated transport nodes to open outbound bridges to (`host:bridgePort`). |
 | `-store` | `SYNCSWARM_STORE_FORWARD` | `true` | Hold messages for offline recipients. |
 | `-store-ttl` | `SYNCSWARM_STORE_FORWARD_TTL` | default | How long to hold offline messages (e.g. `30m`). |
 | `-scoring` | `SYNCSWARM_RELAY_SCORING` | `true` | Challenge peer relays; route around silent droppers. |
@@ -82,6 +133,27 @@ There is **no content-key option** — a relay never needs one.
   address (a VPS, or port-forwarding on your router).
 - To join an existing swarm, point `-boot` at one or more known peers. To start a
   new swarm, run the first relay with no `-boot` and give its address to others.
+- **Firewall (ufw):** `sudo ufw allow 64512/udp && sudo ufw allow 64513/tcp`. Leave
+  the health port (`8080`) closed — bind it to `127.0.0.1`.
+
+### Running several relays (mesh them)
+
+More independent relays across different networks/operators = more resilience and
+path diversity. To link them into one swarm, give each one another's public address
+via `-boot`:
+
+- Relay **A**: `-boot B_PUBLIC_IP:64512`
+- Relay **B**: `-boot A_PUBLIC_IP:64512`
+
+They discover each other and merge into a single swarm; a client that reaches **any**
+relay reaches the whole network. Point clients at all of them for redundancy:
+
+```go
+swarmsync.Options{ BootstrapPeers: []string{"A_PUBLIC_IP:64512", "B_PUBLIC_IP:64512"} }
+```
+
+(Two public relays link over UDP discovery — no TCP bridge needed. Bridges are for
+pulling *NAT'd* nodes into the swarm.)
 
 ## Health & metrics
 
