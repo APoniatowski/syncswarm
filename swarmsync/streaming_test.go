@@ -145,12 +145,12 @@ func TestStrictAnonymityErrorsWithoutRelay(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 		if err := sender.SendTo([]byte("secret"), dest.NodeID()); err != nil {
-			if !bytes.Contains([]byte(err.Error()), []byte("strict anonymity")) {
+			if !bytes.Contains([]byte(err.Error()), []byte("no relay route")) {
 				continue // may still be "not active" until discovery settles
 			}
 			// SendStream must fail the same way.
-			if serr := sender.SendStream(bytes.NewReader(bytes.Repeat([]byte("x"), 40000)), dest.NodeID()); serr == nil || !bytes.Contains([]byte(serr.Error()), []byte("strict anonymity")) {
-				t.Fatalf("SendStream strict-anonymity error = %v, want strict-anonymity failure", serr)
+			if serr := sender.SendStream(bytes.NewReader(bytes.Repeat([]byte("x"), 40000)), dest.NodeID()); serr == nil || !bytes.Contains([]byte(serr.Error()), []byte("no relay route")) {
+				t.Fatalf("SendStream fail-closed error = %v, want no-relay-route failure", serr)
 			}
 			return
 		}

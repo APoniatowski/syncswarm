@@ -2,6 +2,7 @@ package iface
 
 import (
 	"bytes"
+	"net"
 	"testing"
 	"time"
 )
@@ -140,31 +141,21 @@ func TestTCPServerBroadcast(t *testing.T) {
 	}
 }
 
-func TestRadioStubsDegradeCleanly(t *testing.T) {
-	lora := NewLoRaInterface("lora0", "/dev/ttyUSB0")
-	serial := NewSerialInterface("ser0", "/dev/ttyS0", 9600)
+// TestRadioKindsAndCaps checks the LoRa/serial radio interfaces report the right
+// medium properties, exercised over an in-memory pipe (no hardware). The serial
+// device opener is covered on Linux only; here we drive the KISS engine directly.
+func TestRadioKindsAndCaps(t *testing.T) {
+	_, pipe := net.Pipe()
+	k := NewKISSInterface("lora0", pipe, KindLoRa, Caps{MTU: 500, Broadcast: true})
+	defer k.Close()
 
-	for _, s := range []Interface{lora, serial} {
-		if err := s.Send(Broadcast, []byte("x")); err != ErrNotImplemented {
-			t.Fatalf("%s Send = %v, want ErrNotImplemented", s.Name(), err)
-		}
-		// Frames() must be a closed channel (ranging exits immediately).
-		select {
-		case _, ok := <-s.Frames():
-			if ok {
-				t.Fatalf("%s Frames yielded a value, want closed", s.Name())
-			}
-		case <-time.After(time.Second):
-			t.Fatalf("%s Frames() blocked; want closed channel", s.Name())
-		}
-		if s.Caps().MTU != 500 {
-			t.Fatalf("%s MTU = %d, want 500", s.Name(), s.Caps().MTU)
-		}
-		if err := s.Close(); err != nil {
-			t.Fatalf("%s Close: %v", s.Name(), err)
-		}
+	if k.Kind() != KindLoRa {
+		t.Fatalf("kind = %v, want %v", k.Kind(), KindLoRa)
 	}
-	if lora.Kind() != KindLoRa || serial.Kind() != KindSerial {
-		t.Fatal("unexpected stub kinds")
+	if k.Caps().MTU != 500 {
+		t.Fatalf("MTU = %d, want 500", k.Caps().MTU)
+	}
+	if err := k.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
 	}
 }

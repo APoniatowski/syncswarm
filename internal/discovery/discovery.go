@@ -33,6 +33,18 @@ const (
 	maxPeers          = 512 // total peer-table cap
 	maxPeersPerSubnet = 8   // cap on non-bootstrap peers sharing an IP /24 (or /48)
 	maxGossipAccept   = 32  // peers merged from a single gossip message
+
+	// maxVerifyPerRound bounds how many gossip-discovered (unverified) peers are
+	// probed per latency round. Each probe can cost up to maxLatency, so an
+	// unbounded sweep of a full table would stall the maintenance loop.
+	maxVerifyPerRound = 8
+
+	// latencyProbeConcurrency bounds how many latency checks run at once. Probes
+	// are mostly idle waiting on a reply, so a modest pool turns a round that
+	// scaled with the table (2s per unreachable peer, sequentially) into one that
+	// scales with table/concurrency — while staying a small enough burst not to
+	// look like a scan or overwhelm a low-powered peer.
+	latencyProbeConcurrency = 16
 )
 
 // Node represents a discovered peer in the network
@@ -78,6 +90,11 @@ type Discovery struct {
 	// (created in Start when a signing key is set). Nil until then.
 	linkMgr *link.Manager
 
+	// bridges tracks each bridge interface's liveness so a bridge that connects
+	// but never carries traffic (silently misconfigured/filtered) is reported,
+	// instead of sitting at "bridges: 1, peers: 0". Keyed by interface name.
+	bridges map[string]*bridgeStat
+
 	// Reticulum-style announce discovery: a path table built from flooded
 	// announces, plus a dedup set to suppress re-forwarding the same announce.
 	paths   *pathTable
@@ -85,10 +102,15 @@ type Discovery struct {
 	ctx     context.Context
 	cancel  context.CancelFunc
 
+	// Per-hop transport routing (P3): a dedup set bounding routed-packet loops and
+	// a handler invoked when a routed packet reaches this node as its destination.
+	routedSeen *dedupSet
+	onRouted   atomic.Pointer[func(inner []byte, origin string)]
+
 	nonceCounter atomic.Uint64
 
 	pendingMu sync.Mutex
-	pending   map[uint64]chan time.Time
+	pending   map[uint64]pendingLatency
 
 	// Kademlia routing table for structured NodeID -> address lookup (10.4). Nil
 	// when selfID is not a valid DHT key (e.g. in unit tests using symbolic IDs),
@@ -108,6 +130,9 @@ type Discovery struct {
 	reachable      bool
 	onReachability func(bool)
 	reachPending   map[uint64]chan bool
+	// soloFailures counts consecutive rounds in which the only responder reported
+	// the data port unreachable (see reachSoloRounds).
+	soloFailures int
 
 	// Local advertised identity (set via SetIdentity; zero values until then).
 	pubKey       []byte
@@ -115,6 +140,7 @@ type Discovery struct {
 	port         uint16
 	capabilities []string
 	relayIDs     []string // relays we hold circuit reservations with (advertised)
+	bridgePSKVal []byte   // optional PSK gating who may attach a TCP bridge
 
 	// observedCounts tallies the external addresses peers report seeing us at,
 	// so we can learn our own public (reflexive) address behind NAT.
@@ -144,6 +170,21 @@ type Discovery struct {
 	// expired over this node's lifetime. Guarded by mu.
 	joins     uint64
 	evictions uint64
+}
+
+// pendingLatency is one outstanding latency check: the channel awaiting the
+// reply, plus the node ID we addressed the check to.
+//
+// The node ID matters for correctness, not bookkeeping. Liveness must prove that
+// *that identity* is still there, not merely that something answers at its
+// address. Without the binding, a node whose identity changed (storage wiped,
+// host re-provisioned) leaves a ghost entry that its own successor keeps marking
+// active by replying at the same address — and because path selection seals onion
+// layers to the ghost's advertised public key, traffic routed through it is
+// silently undeliverable.
+type pendingLatency struct {
+	nodeID string
+	ch     chan time.Time
 }
 
 // PeerHealth is a point-in-time view of the peer table's composition and churn,
@@ -185,14 +226,16 @@ func (d *Discovery) PeerHealth() PeerHealth {
 // of 0 requests an ephemeral port (useful for tests and multiple nodes per host);
 // use Port() to read the actual bound port.
 func NewDiscovery(selfID string, listenPort int) (*Discovery, error) {
-	// Bind a broadcast-capable UDP datagram interface. The send MTU is set well
-	// above the 4 KiB read buffer legacy discovery used, so no packet that worked
-	// before (e.g. a large gossip peer-exchange) is now rejected.
-	udp, err := iface.NewUDPInterfaceMTU(
+	// Bind a broadcast-capable UDP datagram interface. It advertises a
+	// fragmentation-safe sizing MTU (so payload-sizing layers like Links keep
+	// datagrams within one IP packet), while the hard send cap stays at the UDP
+	// payload max so large legacy gossip (peer-exchange) is still accepted.
+	udp, err := iface.NewUDPInterfaceSized(
 		"udp0",
 		fmt.Sprintf(":%d", listenPort),
 		fmt.Sprintf("255.255.255.255:%d", discoveryPort),
-		65507, // UDP payload max
+		iface.SafeDatagramMTU, // advertised: avoid IP fragmentation
+		65507,                 // hard cap: UDP payload max (legacy gossip)
 	)
 	if err != nil {
 		return nil, err
@@ -209,14 +252,16 @@ func NewDiscovery(selfID string, listenPort int) (*Discovery, error) {
 		nodeIface:      make(map[string]iface.Interface),
 		ctx:            ctx,
 		cancel:         cancel,
-		pending:        make(map[uint64]chan time.Time),
+		pending:        make(map[uint64]pendingLatency),
 		observedCounts: make(map[string]int),
 		listenPort:     udp.LocalAddr().(*net.UDPAddr).Port,
 		lookups:        make(map[uint64]chan []protocol.DHTContact),
 		reachPending:   make(map[uint64]chan bool),
 		paths:          newPathTable(maxPaths),
 		seenAnn:        newDedupSet(announceDedupTTL),
+		routedSeen:     newDedupSet(announceDedupTTL),
 		addrIface:      make(map[string]iface.Interface),
+		bridges:        make(map[string]*bridgeStat),
 	}
 	// Enable the Kademlia routing table only when selfID is a valid DHT key.
 	if id, err := dht.ParseID(selfID); err == nil {
@@ -226,12 +271,51 @@ func NewDiscovery(selfID string, listenPort int) (*Discovery, error) {
 	return d, nil
 }
 
+// SetBridgePSK sets the pre-shared key required to attach a TCP bridge, in either
+// direction. Empty (the default) leaves bridges open. Call before adding bridges;
+// it does not re-authenticate ones already attached.
+//
+// This is access control, not confidentiality: discovery packets are already
+// signed and payloads sealed end to end. What it decides is *who may attach at
+// all* — a bridge host sees the discovery metadata of everyone bridged through it
+// and can selectively drop traffic, so a private deployment should not accept
+// arbitrary peers (SECURITY_AUDIT.md finding 3).
+func (d *Discovery) SetBridgePSK(psk []byte) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.bridgePSKVal = append([]byte(nil), psk...)
+}
+
+func (d *Discovery) bridgePSK() []byte {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.bridgePSKVal
+}
+
 // SetRelayIDs advertises the relays this node holds circuit reservations with,
 // so peers can route to it through one of them when it is not directly reachable.
 func (d *Discovery) SetRelayIDs(ids []string) {
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	changed := len(ids) != len(d.relayIDs)
+	if !changed {
+		for i := range ids {
+			if ids[i] != d.relayIDs[i] {
+				changed = true
+				break
+			}
+		}
+	}
 	d.relayIDs = append([]string(nil), ids...)
+	d.mu.Unlock()
+
+	// Reservations now propagate in the signed announce rather than in gossip, so
+	// gaining or losing one has to re-announce: otherwise a NAT'd node stays
+	// unreachable until the next periodic flood, and a dropped reservation keeps
+	// drawing traffic to a relay that no longer holds it. Emitted outside the lock
+	// — buildSelfAnnounce takes the read lock.
+	if changed {
+		d.announceSelf()
+	}
 }
 
 // SetRelay toggles this node's advertised "relay" capability at runtime and
@@ -411,6 +495,9 @@ func (d *Discovery) Start() {
 	// can receive inbound link frames.
 	if len(d.signPriv) == ed25519.PrivateKeySize && d.linkMgr == nil {
 		d.linkMgr = link.NewManager(d.signPriv, d.linkSend)
+		// Size link message chunks to the transport a peer is reached over, so
+		// datagram/radio links don't emit IP-fragmenting frames.
+		d.linkMgr.SetMTUFunc(d.mtuFor)
 	}
 
 	// Fan every interface's inbound frames into the merged channel the read loop
@@ -509,6 +596,18 @@ func (d *Discovery) listenForPeers() {
 					d.linkMgr.Deliver(remoteAddr.String(), &packet)
 				}
 				continue
+			case protocol.PacketTypeRoutedDiscovery:
+				// Same per-hop forwarding as PacketTypeRouted, but the inner bytes
+				// are a signed discovery packet destined for this node's own
+				// discovery processing rather than the application handler.
+				d.handleRoutedDiscovery(&packet, remoteAddr, srcIface)
+				continue
+			case protocol.PacketTypeRouted:
+				// Per-hop transport routing: forwarded before the signature gate
+				// because forwarding mutates the hop limit and the payload is
+				// self-authenticating (sealed end to end). Dedup + hop limit bound it.
+				d.handleRouted(&packet)
+				continue
 			}
 
 			// Drop packets that fail integrity verification
@@ -529,11 +628,18 @@ func (d *Discovery) listenForPeers() {
 				}
 				// Cap peers accepted from one gossip message so a single sender
 				// cannot flood the table.
+				// A gossip payload is signed by its sender, so the entry describing
+				// the *sender itself* is a first-party statement — the same binding
+				// the direct discovery path requires. Entries about anyone else are
+				// third-party claims. Only the former may assert capabilities and
+				// reservation relays.
+				gossiper := packet.SignerID()
+				selfAttested := gossiper != "" && packet.SourceNode == gossiper
 				for i, pi := range px.Peers {
 					if i >= maxGossipAccept {
 						break
 					}
-					d.mergePeer(pi)
+					d.mergePeer(pi, selfAttested && pi.NodeID == gossiper)
 				}
 				continue
 			}
@@ -632,13 +738,18 @@ func (d *Discovery) listenForPeers() {
 				if payload.ObservedAddr != "" {
 					d.recordObserved(payload.ObservedAddr)
 				}
-				// Deliver the arrival time to the waiting measureLatency call.
+				// Deliver the arrival time to the waiting measureLatency call — but
+				// only if the reply came from the node we actually probed. The
+				// signer is authenticated (the packet passed Verify above) and node
+				// IDs are key-derived, so this rejects a reply from a *different*
+				// node answering at the same address, which would otherwise keep a
+				// stale identity alive forever.
 				d.pendingMu.Lock()
-				ch, ok := d.pending[payload.Nonce]
+				p, ok := d.pending[payload.Nonce]
 				d.pendingMu.Unlock()
-				if ok {
+				if ok && p.nodeID == packet.SignerID() {
 					select {
-					case ch <- time.Now():
+					case p.ch <- time.Now():
 					default:
 					}
 				}
@@ -689,7 +800,8 @@ func (d *Discovery) maintainPeers() {
 		case <-gossipTicker.C:
 			d.gossipPeers()
 			d.refreshDHT()
-			d.savePeerCache() // persist known peers so restarts re-bootstrap from them
+			d.savePeerCache()       // persist known peers so restarts re-bootstrap from them
+			d.checkBridgeLiveness() // warn about a bridge that connected but carries no traffic
 		case <-reachTicker.C:
 			d.reachMu.Lock()
 			enabled := d.reachEnabled
@@ -717,6 +829,26 @@ func (d *Discovery) refreshDHT() {
 // arguments carry the identity/routing information advertised in the discovery
 // payload; empty/zero values leave any previously learned data untouched.
 func (d *Discovery) updateNode(nodeID, addr string, pubKey, signKey []byte, port uint16, capabilities, relayIDs []string, mlkemPub []byte) {
+	d.upsertNode(nodeID, addr, pubKey, signKey, port, capabilities, relayIDs, mlkemPub, true)
+}
+
+// learnCandidate records a node we heard about from a third party (a DHT
+// FIND_NODE contact list) rather than from the node itself. It learns identity
+// and metadata — the (ID, key) binding is verified by the caller — but does NOT
+// assert liveness: the peer is admitted unverified and only becomes active by
+// answering our own authenticated latency check.
+//
+// Without this split, every 30s DHT refresh re-activated peers that the latency
+// round had just demoted, so dead nodes oscillated in and out of the routing set
+// forever. Liveness is first-hand only.
+func (d *Discovery) learnCandidate(nodeID, addr string, pubKey, signKey []byte, port uint16, capabilities, relayIDs []string, mlkemPub []byte) {
+	d.upsertNode(nodeID, addr, pubKey, signKey, port, capabilities, relayIDs, mlkemPub, false)
+}
+
+// upsertNode is the single chokepoint for adding/updating a peer. verified says
+// whether the caller has first-hand, authenticated proof the node is alive right
+// now (it signed a packet we received from it) — only then may liveness be set.
+func (d *Discovery) upsertNode(nodeID, addr string, pubKey, signKey []byte, port uint16, capabilities, relayIDs []string, mlkemPub []byte, verified bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
@@ -725,9 +857,19 @@ func (d *Discovery) updateNode(nodeID, addr string, pubKey, signKey []byte, port
 	}
 
 	if node, exists := d.nodes[nodeID]; exists {
-		node.LastSeen = time.Now()
-		node.Active = true
-		node.Address = addr
+		if verified {
+			node.LastSeen = time.Now()
+			node.Active = true
+			node.Address = addr
+		} else if node.Address == "" && addr != "" {
+			// Filling a blank is not overwriting. A peer first heard of through a
+			// forwarded announce is recorded with no address at all; refusing every
+			// unverified address then leaves it permanently unroutable, because the
+			// DHT contact list that could resolve it is unverified too. The peer
+			// still stays inactive until it answers our own latency check, so this
+			// grants reachability information, never liveness.
+			node.Address = addr
+		}
 		if len(pubKey) > 0 {
 			node.PubKey = pubKey
 		}
@@ -743,16 +885,33 @@ func (d *Discovery) updateNode(nodeID, addr string, pubKey, signKey []byte, port
 		if len(mlkemPub) > 0 {
 			node.MLKEMPub = mlkemPub
 		}
-		node.RelayIDs = relayIDs
+		// nil means "this message carries no reservation information", not "the
+		// peer has none". Announces cannot carry RelayIDs at all (AnnouncePayload
+		// has no such field) and pass nil — so assigning unconditionally let every
+		// announce WIPE the reservation relays a discovery packet had just
+		// advertised. A NAT'd node's circuit reservation was therefore erased about
+		// as fast as it was published, senders never saw a relay to route the final
+		// hop through, and delivery to any NAT'd peer quietly failed. An explicit
+		// empty (non-nil) list still clears them, which is how a node that has
+		// dropped its reservations says so — in practice an *empty* list is also
+		// treated as "no information", because JSON round-trips make nil and []
+		// indistinguishable in places. Stale RelayIDs are harmless: CircuitReachable
+		// requires the named relay to be verified and active, and a send through a
+		// dead circuit fails and surfaces via ConfirmDelivery.
+		if len(relayIDs) > 0 {
+			node.RelayIDs = relayIDs
+		}
 	} else {
 		if !d.admitLocked(addr) {
 			return // table/subnet full of fresher peers; resist eclipse
 		}
 		d.nodes[nodeID] = &Node{
-			ID:           nodeID,
-			Address:      addr,
+			ID:      nodeID,
+			Address: addr,
+			// An unverified candidate is admitted but stays out of routing until
+			// it answers a latency check itself.
 			LastSeen:     time.Now(),
-			Active:       true,
+			Active:       verified,
 			PubKey:       pubKey,
 			SignKey:      signKey,
 			Port:         port,
@@ -768,10 +927,26 @@ func (d *Discovery) updateNode(nodeID, addr string, pubKey, signKey []byte, port
 	d.rtUpdate(nodeID, addr, port)
 }
 
+// attestedOnly returns v when the record it came from was signed by its own
+// subject, and nil otherwise — so a third party's claim about someone else's
+// capabilities or reservation relays is dropped rather than believed.
+func attestedOnly(selfAttested bool, v []string) []string {
+	if !selfAttested {
+		return nil
+	}
+	return v
+}
+
 // mergePeer folds a gossiped PeerInfo record into the node table. It adds
 // previously unknown peers, refreshes LastSeen and identity fields for known
 // ones, never regresses a node to staler data, and skips the local node.
-func (d *Discovery) mergePeer(pi protocol.PeerInfo) {
+//
+// selfAttested means this record describes the peer that signed the gossip
+// message — a first-party statement, carrying the same authority as a direct
+// discovery packet. Only such a record may set Capabilities and RelayIDs; for
+// anyone else those fields are an unverifiable claim about a third party (see
+// SECURITY_AUDIT.md finding 2).
+func (d *Discovery) mergePeer(pi protocol.PeerInfo, selfAttested bool) {
 	if pi.NodeID == "" || pi.NodeID == d.selfID {
 		return
 	}
@@ -790,8 +965,15 @@ func (d *Discovery) mergePeer(pi protocol.PeerInfo) {
 		if pi.LastSeen.Before(node.LastSeen) {
 			return
 		}
-		node.LastSeen = pi.LastSeen
-		node.Active = true
+		// Deliberately NOT updating LastSeen or Active here. Gossip is a third
+		// party's claim about a peer, not evidence the peer is alive: a dead node
+		// would otherwise be resurrected forever by whoever still gossips it (two
+		// peers can keep each other's stale entries alive indefinitely), and an
+		// entry marked active is eligible for routing — where traffic sealed to a
+		// departed node's key becomes a silent black hole. Liveness is first-hand
+		// only, established by an authenticated latency check. Metadata below is
+		// safe to learn from gossip because the (ID, key) binding was verified
+		// above.
 		if pi.Address != "" {
 			node.Address = pi.Address
 		}
@@ -804,13 +986,17 @@ func (d *Discovery) mergePeer(pi protocol.PeerInfo) {
 		if pi.Port != 0 {
 			node.Port = pi.Port
 		}
-		if len(pi.Capabilities) > 0 {
+		if selfAttested && len(pi.Capabilities) > 0 {
 			node.Capabilities = pi.Capabilities
 		}
 		if len(pi.MLKEMPub) > 0 {
 			node.MLKEMPub = pi.MLKEMPub
 		}
-		node.RelayIDs = pi.RelayIDs
+		// Only a non-empty list carries information: an omitted list means "this
+		// message says nothing about reservations", not "the peer has none".
+		if selfAttested && len(pi.RelayIDs) > 0 {
+			node.RelayIDs = pi.RelayIDs
+		}
 		return
 	}
 
@@ -822,15 +1008,20 @@ func (d *Discovery) mergePeer(pi protocol.PeerInfo) {
 		lastSeen = time.Now()
 	}
 	d.nodes[pi.NodeID] = &Node{
-		ID:           pi.NodeID,
-		Address:      pi.Address,
-		LastSeen:     lastSeen,
-		Active:       true,
-		PubKey:       pi.PubKey,
-		SignKey:      pi.SignKey,
-		Port:         pi.Port,
-		Capabilities: pi.Capabilities,
-		RelayIDs:     pi.RelayIDs,
+		ID:      pi.NodeID,
+		Address: pi.Address,
+		// Admitted as a candidate, not as a live peer: a gossiped node is
+		// unverified until it answers an authenticated latency check itself
+		// (checkLatencies promotes it). Until then it is not routed through.
+		LastSeen: lastSeen,
+		Active:   false,
+		PubKey:   pi.PubKey,
+		SignKey:  pi.SignKey,
+		Port:     pi.Port,
+		// Third-party records contribute identity only; a first-party one may also
+		// state what it is and how to reach it.
+		Capabilities: attestedOnly(selfAttested, pi.Capabilities),
+		RelayIDs:     attestedOnly(selfAttested, pi.RelayIDs),
 		MLKEMPub:     pi.MLKEMPub,
 	}
 	d.joins++
@@ -840,23 +1031,58 @@ func (d *Discovery) mergePeer(pi protocol.PeerInfo) {
 func (d *Discovery) checkLatencies() {
 	d.mu.RLock()
 	nodes := make([]*Node, 0, len(d.nodes))
+	// Unverified peers are ones we only know from gossip. They are probed too,
+	// because a first-hand check is now the *only* way a peer becomes active —
+	// without this they could never be used. Bounded per round so a table full of
+	// stale entries cannot stall the loop (each probe costs up to maxLatency).
+	unverified := make([]*Node, 0, maxVerifyPerRound)
 	for _, node := range d.nodes {
 		if node.Active {
 			nodes = append(nodes, node)
+		} else if len(unverified) < maxVerifyPerRound {
+			unverified = append(unverified, node)
 		}
 	}
 	d.mu.RUnlock()
 
-	for _, node := range nodes {
+	// Probe concurrently, bounded. Each unreachable peer costs a full maxLatency
+	// timeout, so a sequential sweep scaled with the table: ~40s for 20 peers and
+	// ~17 minutes at maxPeers, during which nothing got re-verified. That matters
+	// more now that a first-hand probe is the only way a peer becomes active.
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, latencyProbeConcurrency)
+
+	probe := func(node *Node, promote bool) {
+		defer wg.Done()
+		defer func() { <-sem }()
 		latency := d.measureLatency(node)
 		d.mu.Lock()
+		defer d.mu.Unlock()
 		if latency > maxLatency {
-			node.Active = false
-		} else {
-			node.Latency = latency
+			if !promote {
+				node.Active = false // an active peer that stopped answering
+			}
+			return // an unverified candidate simply stays unverified
 		}
-		d.mu.Unlock()
+		node.Latency = latency
+		if promote {
+			node.Active = true
+			node.LastSeen = time.Now()
+		}
 	}
+
+	for _, node := range nodes {
+		wg.Add(1)
+		sem <- struct{}{}
+		go probe(node, false)
+	}
+	// Promote a candidate we only know by hearsay once it answers us directly.
+	for _, node := range unverified {
+		wg.Add(1)
+		sem <- struct{}{}
+		go probe(node, true)
+	}
+	wg.Wait()
 }
 
 // measureLatency sends a latency check packet to a node and measures the real
@@ -870,8 +1096,15 @@ func (d *Discovery) measureLatency(node *Node) time.Duration {
 	nodeAddr, nodeID := node.Address, node.ID
 	d.mu.RUnlock()
 
-	addr, err := net.ResolveUDPAddr("udp", nodeAddr)
-	if err != nil {
+	// A peer reached through a bridge, or learned by routing, has no address we can
+	// use: a bridge interface writes to its single connection and ignores the
+	// address argument, so an interface-addressed check would be delivered to the
+	// bridge peer, which answers as itself and is correctly rejected by
+	// identity-bound liveness. Such peers could therefore never be verified. Route
+	// the check by destination instead.
+	addr, addrErr := net.ResolveUDPAddr("udp", nodeAddr)
+	viaRoute := nodeAddr == "" || addrErr != nil || d.routedOnly(nodeID)
+	if !viaRoute && addr == nil {
 		return maxLatency + time.Nanosecond
 	}
 
@@ -881,7 +1114,7 @@ func (d *Discovery) measureLatency(node *Node) time.Duration {
 	replyCh := make(chan time.Time, 1)
 
 	d.pendingMu.Lock()
-	d.pending[nonce] = replyCh
+	d.pending[nonce] = pendingLatency{nodeID: nodeID, ch: replyCh}
 	d.pendingMu.Unlock()
 
 	defer func() {
@@ -904,7 +1137,26 @@ func (d *Discovery) measureLatency(node *Node) time.Duration {
 	packetBytes, _ := packet.MarshalBinary()
 
 	start := time.Now()
-	if err := d.ifaceFor(nodeID).Send(addr.String(), packetBytes); err != nil {
+	sent := false
+	if viaRoute {
+		sent = d.SendRoutedDiscovery(nodeID, packetBytes, 0)
+		// Also try the primary datagram interface when we have an address. Hearing
+		// a peer over a bridge does not mean it is *only* reachable that way — a
+		// public relay is reachable by UDP too, and it was being marked
+		// bridge-only purely because its announce last crossed the bridge. Falling
+		// back to ifaceFor here would be pointless: that is the bridge, which
+		// cannot address anything but its own far end. Both probes carry the same
+		// nonce, so whichever arrives first verifies the peer and the other is
+		// ignored.
+		if addr != nil && d.iface != nil {
+			if err := d.iface.Send(addr.String(), packetBytes); err == nil {
+				sent = true
+			}
+		}
+	} else if addr != nil {
+		sent = d.ifaceFor(nodeID).Send(addr.String(), packetBytes) == nil
+	}
+	if !sent {
 		return maxLatency + time.Nanosecond
 	}
 
@@ -958,6 +1210,21 @@ func (d *Discovery) GetActiveNodes() []*Node {
 			nodeCopy := *node
 			nodes = append(nodes, &nodeCopy)
 		}
+	}
+	return nodes
+}
+
+// AllNodes returns a snapshot of every peer in the table — active or not — as
+// copies, so an operator can also see peers that have gone quiet (an inactive
+// entry is often the interesting one when diagnosing a partition).
+func (d *Discovery) AllNodes() []*Node {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+
+	nodes := make([]*Node, 0, len(d.nodes))
+	for _, node := range d.nodes {
+		nodeCopy := *node
+		nodes = append(nodes, &nodeCopy)
 	}
 	return nodes
 }
@@ -1047,16 +1314,20 @@ func (d *Discovery) buildPeerExchangePayload() protocol.PeerExchangePayload {
 		if !node.Active {
 			continue
 		}
+		// Third-party records carry identity and address only. Capabilities and
+		// RelayIDs are omitted: we cannot attest to them for someone else, and
+		// relaying them would only amplify a claim the receiver must ignore
+		// anyway. Peers learn both from the subject's own signed announce. (Our
+		// *own* entry above still carries them, which costs nothing and keeps
+		// pre-announce-RelayIDs peers working.)
 		peers = append(peers, protocol.PeerInfo{
-			NodeID:       node.ID,
-			Address:      node.Address,
-			PubKey:       node.PubKey,
-			SignKey:      node.SignKey,
-			Port:         node.Port,
-			Capabilities: node.Capabilities,
-			RelayIDs:     node.RelayIDs,
-			MLKEMPub:     node.MLKEMPub,
-			LastSeen:     node.LastSeen,
+			NodeID:   node.ID,
+			Address:  node.Address,
+			PubKey:   node.PubKey,
+			SignKey:  node.SignKey,
+			Port:     node.Port,
+			MLKEMPub: node.MLKEMPub,
+			LastSeen: node.LastSeen,
 		})
 	}
 

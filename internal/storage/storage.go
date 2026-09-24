@@ -47,7 +47,7 @@ func NewStorage(baseDir string) (*Storage, error) {
 	}
 
 	for _, dir := range dirs {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0o700); err != nil { // node-private storage tree
 			return nil, fmt.Errorf("failed to create directory %s: %w", dir, err)
 		}
 	}
@@ -80,14 +80,14 @@ func (s *Storage) SaveOffline(nodeID string, seq uint64, blob []byte, expiry tim
 	defer s.mu.Unlock()
 
 	dir := s.offlineNodeDir(nodeID)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil { // holds queued (sealed) messages
 		return fmt.Errorf("failed to create offline dir: %w", err)
 	}
 	buf := make([]byte, 8+len(blob))
 	binary.BigEndian.PutUint64(buf[:8], uint64(expiry.UnixNano()))
 	copy(buf[8:], blob)
 	path := filepath.Join(dir, fmt.Sprintf("%d.blob", seq))
-	if err := os.WriteFile(path, buf, 0644); err != nil {
+	if err := os.WriteFile(path, buf, 0o600); err != nil { // queued message content
 		return fmt.Errorf("failed to write offline blob: %w", err)
 	}
 	return nil
@@ -179,7 +179,7 @@ func (s *Storage) SaveNode(node *discovery.Node) error {
 	}
 
 	filename := filepath.Join(s.baseDir, nodesDir, node.ID+".json")
-	return os.WriteFile(filename, data, 0644)
+	return os.WriteFile(filename, data, 0644) // #nosec G306 -- public peer metadata (NodeID, address, public keys)
 }
 
 // LoadNodes retrieves all stored nodes
@@ -224,13 +224,13 @@ func (s *Storage) SaveChunk(id [32]byte, chunkNum uint32, data []byte, meta *Chu
 
 	// Create chunk directory if it doesn't exist
 	chunkDir := filepath.Join(s.baseDir, chunksDir, hexID)
-	if err := os.MkdirAll(chunkDir, 0755); err != nil {
+	if err := os.MkdirAll(chunkDir, 0o700); err != nil {
 		return err
 	}
 
 	// Save chunk data
 	chunkPath := filepath.Join(chunkDir, fmt.Sprintf("%d.chunk", chunkNum))
-	if err := os.WriteFile(chunkPath, data, 0644); err != nil {
+	if err := os.WriteFile(chunkPath, data, 0o600); err != nil { // stored payload
 		return err
 	}
 
@@ -241,7 +241,7 @@ func (s *Storage) SaveChunk(id [32]byte, chunkNum uint32, data []byte, meta *Chu
 		if err != nil {
 			return err
 		}
-		return os.WriteFile(metaPath, metaData, 0644)
+		return os.WriteFile(metaPath, metaData, 0o600) // chunk metadata
 	}
 
 	return nil

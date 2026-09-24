@@ -58,10 +58,12 @@ type dataPayload struct {
 type Link struct {
 	ID        [16]byte
 	peerAddr  string
+	peerKey   string // cache key when this link is reusable (initiator side); "" otherwise
 	aead      cipher.AEAD
 	initiator bool // sets the nonce direction bit, so the two sides never collide
 	sendCtr   atomic.Uint64
 	onData    atomic.Pointer[func([]byte)]
+	router    atomic.Pointer[Router] // idempotent per-link Router (set by NewRouter)
 	mgr       *Manager
 }
 
@@ -74,8 +76,25 @@ type Manager struct {
 	mu      sync.Mutex
 	links   map[[16]byte]*Link
 	pending map[[16]byte]*pendingDial
+	byPeer  map[string]*Link // reusable initiator-side links, keyed by peer identity
 
-	onLink atomic.Pointer[func(*Link)] // fired when an inbound link is established
+	onLink atomic.Pointer[func(*Link)]      // fired when an inbound link is established
+	mtuOf  atomic.Pointer[func(string) int] // optional: transport MTU for a peer address
+}
+
+// SetMTUFunc installs a lookup that reports the transport MTU (bytes) for a peer
+// address, so SendMessage sizes chunks to the medium and avoids IP fragmentation
+// (or fits a small-MTU radio link). A nil/zero result falls back to the default
+// chunk size. Safe to call concurrently.
+func (m *Manager) SetMTUFunc(fn func(addr string) int) { m.mtuOf.Store(&fn) }
+
+// chunkFor returns the max plaintext chunk for a peer address using the installed
+// MTU func, or the default when none is set.
+func (m *Manager) chunkFor(addr string) int {
+	if fp := m.mtuOf.Load(); fp != nil {
+		return maxChunkForMTU((*fp)(addr))
+	}
+	return maxMessageChunk
 }
 
 type pendingDial struct {
@@ -92,6 +111,7 @@ func NewManager(self ed25519.PrivateKey, send SendFunc) *Manager {
 		send:    send,
 		links:   make(map[[16]byte]*Link),
 		pending: make(map[[16]byte]*pendingDial),
+		byPeer:  make(map[string]*Link),
 	}
 }
 
@@ -136,6 +156,45 @@ func (m *Manager) Dial(addr string, destSignPub ed25519.PublicKey, timeout time.
 	case <-time.After(timeout):
 		return nil, fmt.Errorf("link: handshake to %s timed out", addr)
 	}
+}
+
+// DialCached returns a reusable link to the peer identified by destSignPub,
+// establishing one only if there isn't a live cached link already. Reuse avoids a
+// handshake per transfer (essential for onion forwarding, which sends many
+// fragment copies per hop). The link is evicted from the cache when it is closed.
+func (m *Manager) DialCached(addr string, destSignPub ed25519.PublicKey, timeout time.Duration) (*Link, error) {
+	key := peerKey(destSignPub, addr)
+	m.mu.Lock()
+	if l := m.byPeer[key]; l != nil {
+		m.mu.Unlock()
+		return l, nil
+	}
+	m.mu.Unlock()
+
+	l, err := m.Dial(addr, destSignPub, timeout)
+	if err != nil {
+		return nil, err
+	}
+	m.mu.Lock()
+	if existing := m.byPeer[key]; existing != nil {
+		// Lost a race with a concurrent dial; keep the first and drop this one.
+		m.mu.Unlock()
+		l.Close()
+		return existing, nil
+	}
+	l.peerKey = key
+	m.byPeer[key] = l
+	m.mu.Unlock()
+	return l, nil
+}
+
+// peerKey identifies a peer for link reuse: its signing key when known (stable
+// across address changes), else its address.
+func peerKey(destSignPub ed25519.PublicKey, addr string) string {
+	if len(destSignPub) > 0 {
+		return "k:" + string(destSignPub)
+	}
+	return "a:" + addr
 }
 
 // Deliver feeds an inbound link-typed packet (request/proof/data) received at
@@ -260,12 +319,17 @@ func (l *Link) OnData(fn func([]byte)) { l.onData.Store(&fn) }
 // direction (a direction bit plus a per-link counter), so the two ends never
 // reuse one.
 func (l *Link) Send(data []byte) error {
+	// Nonce = direction bit (byte 0) || zero || 64-bit monotonic counter. The two
+	// sides share one AEAD key (same ECDH secret + link ID), so cross-direction
+	// uniqueness is required: the direction bit keeps initiator and responder
+	// nonces disjoint, and the per-send counter makes each unique within a
+	// direction. Not a fixed nonce.
 	nonce := make([]byte, l.aead.NonceSize())
 	if l.initiator {
 		nonce[0] = 0x01
 	}
 	binary.BigEndian.PutUint64(nonce[len(nonce)-8:], l.sendCtr.Add(1))
-	ct := l.aead.Seal(nil, nonce, data, nil)
+	ct := l.aead.Seal(nil, nonce, data, nil) // #nosec G407 -- unique counter nonce, see above
 	return l.mgr.sendPacket(l.peerAddr, protocol.PacketTypeLinkData, dataPayload{
 		LinkID: l.ID,
 		Nonce:  nonce,
@@ -278,6 +342,9 @@ func (l *Link) Send(data []byte) error {
 func (l *Link) Close() {
 	l.mgr.mu.Lock()
 	delete(l.mgr.links, l.ID)
+	if l.peerKey != "" && l.mgr.byPeer[l.peerKey] == l {
+		delete(l.mgr.byPeer, l.peerKey)
+	}
 	l.mgr.mu.Unlock()
 }
 

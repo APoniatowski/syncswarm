@@ -10,14 +10,25 @@ import (
 // typical paths (well under the 1500-byte Ethernet MTU minus IP/UDP headers).
 const udpMTU = 1400
 
+// SafeDatagramMTU is the exported fragmentation-safe datagram frame size higher
+// layers can target when sizing payloads for an unknown IP path.
+const SafeDatagramMTU = udpMTU
+
 // UDPInterface is a broadcast-capable datagram transport over a single UDP
 // socket. Send(Broadcast, …) goes to the configured broadcast address; Send to a
 // "host:port" goes unicast. It is the v1 workhorse for discovery and announces.
+//
+// Two size limits: mtu is the *advertised* fragmentation-safe frame size (via
+// Caps, so higher layers size payloads to avoid IP fragmentation), while sendCap
+// is the hard reject limit. They differ for discovery, which advertises a small
+// sizing MTU but still accepts large gossip datagrams (relying on IP
+// fragmentation for those legacy sends).
 type UDPInterface struct {
 	name      string
 	conn      *net.UDPConn
 	broadcast *net.UDPAddr // where Broadcast frames go (may be nil to disable)
-	mtu       int          // max send frame; datagrams larger are rejected
+	mtu       int          // advertised (sizing) MTU reported via Caps
+	sendCap   int          // hard limit; datagrams larger than this are rejected
 	frames    chan InboundFrame
 	done      chan struct{}
 	closeOnce sync.Once
@@ -31,10 +42,20 @@ func NewUDPInterface(name, listenAddr, broadcastAddr string) (*UDPInterface, err
 	return NewUDPInterfaceMTU(name, listenAddr, broadcastAddr, udpMTU)
 }
 
-// NewUDPInterfaceMTU is NewUDPInterface with an explicit send MTU. A larger MTU
-// is used by legacy datagram callers (e.g. gossip) that may emit packets above
-// the fragmentation-avoiding default; the OS still enforces the true UDP limit.
+// NewUDPInterfaceMTU is NewUDPInterface with an explicit MTU used both as the
+// advertised sizing MTU and the hard send cap. Use NewUDPInterfaceSized to make
+// them differ (advertise a small fragmentation-safe MTU while still accepting
+// large datagrams).
 func NewUDPInterfaceMTU(name, listenAddr, broadcastAddr string, mtu int) (*UDPInterface, error) {
+	return NewUDPInterfaceSized(name, listenAddr, broadcastAddr, mtu, mtu)
+}
+
+// NewUDPInterfaceSized separates the advertised (sizing) MTU from the hard send
+// cap. sizingMTU is reported via Caps so higher layers size payloads to avoid IP
+// fragmentation; sendCap is the largest datagram Send will emit (>= sizingMTU),
+// letting legacy large-datagram callers (gossip) through while payload sizing
+// still targets the fragmentation-safe MTU.
+func NewUDPInterfaceSized(name, listenAddr, broadcastAddr string, sizingMTU, sendCap int) (*UDPInterface, error) {
 	la, err := net.ResolveUDPAddr("udp", listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("iface udp: resolve listen %q: %w", listenAddr, err)
@@ -52,11 +73,15 @@ func NewUDPInterfaceMTU(name, listenAddr, broadcastAddr string, mtu int) (*UDPIn
 		}
 	}
 
+	if sendCap < sizingMTU {
+		sendCap = sizingMTU
+	}
 	u := &UDPInterface{
 		name:      name,
 		conn:      conn,
 		broadcast: ba,
-		mtu:       mtu,
+		mtu:       sizingMTU,
+		sendCap:   sendCap,
 		frames:    make(chan InboundFrame, 256),
 		done:      make(chan struct{}),
 	}
@@ -76,8 +101,8 @@ func (u *UDPInterface) Caps() Caps {
 func (u *UDPInterface) LocalAddr() net.Addr { return u.conn.LocalAddr() }
 
 func (u *UDPInterface) Send(addr string, frame []byte) error {
-	if len(frame) > u.mtu {
-		return fmt.Errorf("iface udp: frame %d exceeds MTU %d", len(frame), u.mtu)
+	if len(frame) > u.sendCap {
+		return fmt.Errorf("iface udp: frame %d exceeds send cap %d", len(frame), u.sendCap)
 	}
 	dst := u.broadcast
 	if addr != Broadcast {

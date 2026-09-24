@@ -91,7 +91,7 @@ func (d *Discovery) learnContacts(contacts []protocol.DHTContact) {
 		if protocol.DeriveNodeID(c.SignKey) != c.NodeID {
 			continue // reject unbound identities
 		}
-		d.updateNode(c.NodeID, c.Address, c.PubKey, c.SignKey, c.Port, nil, nil, c.MLKEMPub)
+		d.learnCandidate(c.NodeID, c.Address, c.PubKey, c.SignKey, c.Port, nil, nil, c.MLKEMPub)
 	}
 }
 
@@ -148,7 +148,12 @@ func (d *Discovery) sendFindNode(contact dht.Contact, target string) []dht.Conta
 // when the target is not in the local table, by asking successively closer peers.
 // When the DHT is disabled (symbolic self ID), it falls back to a local lookup.
 func (d *Discovery) FindNode(targetHex string) (*Node, bool) {
-	if node, ok := d.lookupLocal(targetHex); ok {
+	// Short-circuit only on a node we could actually route to. Merely *knowing of*
+	// a peer is not enough: a forwarded announce or a gossip record deliberately
+	// creates an address-less, inactive candidate, and returning one of those would
+	// hand the caller an unroutable node while skipping the very lookup that could
+	// resolve it. Fall through to the DHT instead.
+	if node, ok := d.lookupLocal(targetHex); ok && (node.Active || node.Address != "") {
 		return node, true
 	}
 	if d.rt == nil {
@@ -163,8 +168,62 @@ func (d *Discovery) FindNode(targetHex string) (*Node, bool) {
 		return d.sendFindNode(c, targetHex)
 	})
 
-	// The lookup populated the node table via learnContacts; read the result out.
-	return d.lookupLocal(targetHex)
+	// The lookup populated the node table via learnContacts — as *unverified*
+	// candidates, since a contact list is a third party's claim. FindNode's
+	// contract is "locate and make usable", so prove liveness first-hand here
+	// rather than returning a node the caller cannot actually route to.
+	node, ok := d.lookupLocal(targetHex)
+	if !ok {
+		return nil, false
+	}
+	if node.Active {
+		return node, true
+	}
+	if lat := d.measureLatency(node); lat <= maxLatency {
+		d.mu.Lock()
+		if n, exists := d.nodes[targetHex]; exists {
+			n.Active = true
+			n.Latency = lat
+			n.LastSeen = time.Now()
+		}
+		d.mu.Unlock()
+		return d.lookupLocal(targetHex)
+	}
+	// Located but unreachable: report it as not found rather than hand back a
+	// peer that would silently black-hole the caller's traffic.
+	return nil, false
+}
+
+// NodeByID returns a copy of a known peer regardless of liveness. Callers that
+// need a *usable* peer should normally use GetActiveNodes; this exists for the
+// case where reachability is established by something other than a direct probe
+// (see CircuitReachable).
+func (d *Discovery) NodeByID(id string) (*Node, bool) { return d.lookupLocal(id) }
+
+// CircuitReachable reports whether a peer is reachable through a circuit
+// reservation: it advertises reservation relays, and at least one of those relays
+// is a peer we have verified ourselves.
+//
+// This is the necessary exception to "liveness is first-hand". A peer behind NAT
+// cannot answer a direct latency probe — that is what being behind NAT means — so
+// requiring one makes every NAT'd peer permanently unreachable. What can be
+// verified first-hand is the *relay*, and the relay holds the circuit; delivery is
+// pushed down that held connection rather than dialled. If the circuit is dead the
+// send fails and ConfirmDelivery surfaces it, so this widens reachability without
+// resurrecting the "someone else says it is alive" problem.
+func (d *Discovery) CircuitReachable(id string) bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	n, ok := d.nodes[id]
+	if !ok || len(n.RelayIDs) == 0 {
+		return false
+	}
+	for _, rid := range n.RelayIDs {
+		if r, ok := d.nodes[rid]; ok && r.Active {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *Discovery) lookupLocal(targetHex string) (*Node, bool) {

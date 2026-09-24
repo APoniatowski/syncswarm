@@ -6,8 +6,10 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/APoniatowski/syncswarm/internal/iface"
@@ -152,7 +154,7 @@ func (d *Discovery) announceSelf() {
 		return
 	}
 	if ap := d.buildSelfAnnounce(); ap != nil {
-		d.sendAnnounce(ap)
+		d.sendAnnounceDirect(ap)
 	}
 }
 
@@ -170,6 +172,7 @@ func (d *Discovery) buildSelfAnnounce() *protocol.AnnouncePayload {
 		MLKEMPub:     d.mlkemPub,
 		Port:         d.port,
 		Capabilities: append([]string(nil), d.capabilities...),
+		RelayIDs:     append([]string(nil), d.relayIDs...),
 		Timestamp:    time.Now().UnixNano(),
 		Nonce:        randUint64(),
 		HopCount:     0,
@@ -181,7 +184,13 @@ func (d *Discovery) buildSelfAnnounce() *protocol.AnnouncePayload {
 
 // sendAnnounce wraps an announce payload in a signed packet and broadcasts it on
 // the interface.
-func (d *Discovery) sendAnnounce(ap *protocol.AnnouncePayload) {
+func (d *Discovery) sendAnnounce(ap *protocol.AnnouncePayload) { d.sendAnnounceMode(ap, false) }
+
+// sendAnnounceDirect also delivers point-to-point, for announces that must reach a
+// specific peer we cannot broadcast to (our own, and answers to a path request).
+func (d *Discovery) sendAnnounceDirect(ap *protocol.AnnouncePayload) { d.sendAnnounceMode(ap, true) }
+
+func (d *Discovery) sendAnnounceMode(ap *protocol.AnnouncePayload, direct bool) {
 	if d.iface == nil {
 		return
 	}
@@ -193,7 +202,11 @@ func (d *Discovery) sendAnnounce(ap *protocol.AnnouncePayload) {
 	pkt.SourceNode = d.selfID
 	pkt.Sign(d.signPriv)
 	if b, err := pkt.MarshalBinary(); err == nil {
-		d.floodFrame(b)
+		if direct {
+			d.floodFrameDirect(b)
+		} else {
+			d.floodFrame(b)
+		}
 	}
 }
 
@@ -219,9 +232,27 @@ func (d *Discovery) handleAnnounce(remoteAddr *net.UDPAddr, srcIface iface.Inter
 		return false
 	}
 
-	// Learn the announced node into the peer table, exactly as a discovery packet
-	// would, and record the path we heard it from.
-	d.updateNode(ap.DestHash, remoteAddr.String(), ap.PubKey, ap.SignKey, ap.Port, ap.Capabilities, nil, ap.MLKEMPub)
+	// Learn the announced node, but only treat this as first-hand contact when the
+	// announce came straight from its origin (HopCount 0). Then it is self-signed,
+	// key-bound, and arrived from the origin's own address, so both liveness and
+	// address are trustworthy — the same standing as a discovery packet.
+	//
+	// A re-flooded announce (HopCount > 0) is hearsay twice over: it is no evidence
+	// the origin is still alive, and remoteAddr is the *forwarder's* address, not
+	// the origin's — recording it would corrupt the origin's address with a
+	// transport node's. Learn identity, keys and capabilities only; reachability
+	// for such a node comes from the path table below, and liveness from a
+	// first-hand probe. A later direct announce heals the address automatically.
+	// RelayIDs, unlike the address, IS carried across forwarding: it is covered by
+	// the announcer's own signature (VerifyBound above), so a re-forwarded copy is
+	// still the announcer's own statement about itself, not the forwarder's claim.
+	// This is what lets a NAT'd node's reservations propagate authentically — the
+	// job peer-exchange gossip used to do unauthenticated.
+	if ap.HopCount == 0 {
+		d.updateNode(ap.DestHash, remoteAddr.String(), ap.PubKey, ap.SignKey, ap.Port, ap.Capabilities, ap.RelayIDs, ap.MLKEMPub)
+	} else {
+		d.learnCandidate(ap.DestHash, remoteAddr.String(), ap.PubKey, ap.SignKey, ap.Port, ap.Capabilities, ap.RelayIDs, ap.MLKEMPub)
+	}
 	annCopy := ap // cache a copy so a later path request can re-flood it
 	stored := d.paths.update(ap.DestHash, pathEntry{
 		Iface:    ifaceName(d.iface),
@@ -322,7 +353,10 @@ func (d *Discovery) sendPathRequest(pr *protocol.PathRequestPayload) {
 	pkt.SourceNode = d.selfID
 	pkt.Sign(d.signPriv)
 	if b, err := pkt.MarshalBinary(); err == nil {
-		d.floodFrame(b)
+		// A path request is only useful if it reaches a node that holds the path.
+		// Broadcast reaches the local link; the relays that actually know where a
+		// NAT'd destination lives are reachable only point-to-point.
+		d.floodFrameDirect(b)
 	}
 }
 
@@ -345,7 +379,7 @@ func (d *Discovery) handlePathRequest(pkt *protocol.Packet) (*protocol.AnnounceP
 	if pr.DestHash == d.selfID {
 		ap := d.buildSelfAnnounce()
 		if ap != nil {
-			d.sendAnnounce(ap)
+			d.sendAnnounceDirect(ap)
 		}
 		return ap, false
 	}
@@ -355,7 +389,7 @@ func (d *Discovery) handlePathRequest(pkt *protocol.Packet) (*protocol.AnnounceP
 	if e, ok := d.paths.lookup(pr.DestHash); ok && e.Ann != nil {
 		resp := *e.Ann
 		resp.HopCount = e.Hops + 1
-		d.sendAnnounce(&resp)
+		d.sendAnnounceDirect(&resp)
 		return &resp, false
 	}
 
@@ -386,9 +420,47 @@ type sourcedFrame struct {
 // floodFrame broadcasts a frame across every interface, so announces, path
 // requests, and discovery cross bridges (e.g. a TCP client to another subnet),
 // not just the local UDP broadcast domain.
+// announceFanout bounds how many known peers an announce is unicast to, so
+// flooding stays proportional on a large table. Loops and duplicates are absorbed
+// by the (DestHash, Nonce) dedup set in handleAnnounce.
+const announceFanout = 12
+
 func (d *Discovery) floodFrame(b []byte) {
 	for _, i := range d.ifaces {
 		i.Send(iface.Broadcast, b)
+	}
+}
+
+// floodFrameDirect broadcasts and additionally sends point-to-point to a bounded
+// set of verified peers.
+//
+// Broadcast alone only ever reaches one link, so across the internet — and to any
+// NAT'd peer, which by definition shares no reachable broadcast domain with us — an
+// announce arrives only if it is also sent point-to-point. Without that, a node's
+// signed announce never leaves its own LAN, and the reservation relays a NAT'd node
+// advertises cannot reach the relays that must route to it.
+//
+// This is used ONLY for a node's own announce, never for re-forwarding someone
+// else's. Unicasting forwarded announces too would multiply each announce by the
+// fanout at every transport hop; the originator doing it once is enough to seed the
+// relays it can actually reach, and they redistribute by their existing means.
+func (d *Discovery) floodFrameDirect(b []byte) {
+	d.floodFrame(b)
+
+	d.mu.RLock()
+	targets := make([]struct{ id, addr string }, 0, announceFanout)
+	for _, n := range d.nodes {
+		if len(targets) >= announceFanout {
+			break
+		}
+		if n.Active && n.Address != "" {
+			targets = append(targets, struct{ id, addr string }{n.ID, n.Address})
+		}
+	}
+	d.mu.RUnlock()
+
+	for _, t := range targets {
+		d.ifaceFor(t.id).Send(t.addr, b)
 	}
 }
 
@@ -438,7 +510,7 @@ func (d *Discovery) DialNode(nodeID string, timeout time.Duration) (*link.Link, 
 	if len(node.SignKey) != ed25519.PublicKeySize || node.Address == "" {
 		return nil, fmt.Errorf("node %s missing address or signing key", nodeID)
 	}
-	return d.linkMgr.Dial(node.Address, ed25519.PublicKey(node.SignKey), timeout)
+	return d.linkMgr.DialCached(node.Address, ed25519.PublicKey(node.SignKey), timeout)
 }
 
 // linkSend routes a link frame to addr over the interface that address was last
@@ -453,6 +525,23 @@ func (d *Discovery) linkSend(addr string, frame []byte) error {
 		i = d.iface
 	}
 	return i.Send(addr, frame)
+}
+
+// mtuFor reports the transport MTU for a peer address — the advertised MTU of
+// the interface that address was last heard on (a small datagram/radio MTU or a
+// large TCP-bridge one), or the primary interface's when unknown. Links use it to
+// size message chunks so a datagram frame stays within one packet.
+func (d *Discovery) mtuFor(addr string) int {
+	d.mu.RLock()
+	i := d.addrIface[addr]
+	d.mu.RUnlock()
+	if i == nil {
+		i = d.iface
+	}
+	if i == nil {
+		return 0 // unknown -> link falls back to its default chunk size
+	}
+	return i.Caps().MTU
 }
 
 // rememberAddrIface records the interface a peer address was last heard on.
@@ -476,6 +565,7 @@ func (d *Discovery) fanIn(i iface.Interface) {
 			if !ok {
 				return
 			}
+			d.markIfaceActive(i.Name()) // a frame means this interface (bridge) is live
 			select {
 			case d.inbound <- sourcedFrame{iface: i, frame: f}:
 			case <-d.ctx.Done():
@@ -485,16 +575,75 @@ func (d *Discovery) fanIn(i iface.Interface) {
 	}
 }
 
+// bridgeLivenessTimeout is how long a bridge may carry no traffic after being
+// added before it is reported as likely misconfigured/filtered. A working bridge
+// exchanges announces within a discovery cycle, well under this.
+const bridgeLivenessTimeout = 45 * time.Second
+
+// bridgeStat tracks whether a bridge interface has ever carried a frame, so a
+// silently-dead bridge can be reported once.
+type bridgeStat struct {
+	addr    string
+	created time.Time
+	active  atomic.Bool
+	warned  bool
+}
+
+// registerBridge starts liveness tracking for a bridge interface.
+func (d *Discovery) registerBridge(name, addr string) {
+	if d.bridges == nil {
+		return
+	}
+	d.mu.Lock()
+	d.bridges[name] = &bridgeStat{addr: addr, created: time.Now()}
+	d.mu.Unlock()
+}
+
+// markIfaceActive records that an interface carried a frame (used for bridge
+// liveness; a no-op for interfaces that aren't tracked bridges).
+func (d *Discovery) markIfaceActive(name string) {
+	if d.bridges == nil {
+		return
+	}
+	d.mu.RLock()
+	bs := d.bridges[name]
+	d.mu.RUnlock()
+	if bs != nil {
+		bs.active.Store(true)
+	}
+}
+
+// checkBridgeLiveness warns once for any bridge that has carried no traffic within
+// bridgeLivenessTimeout of being added — the "bridges: 1, peers: 0" case, which is
+// otherwise indistinguishable from a firewalled/misconfigured far side.
+func (d *Discovery) checkBridgeLiveness() {
+	now := time.Now()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for name, bs := range d.bridges {
+		if bs.warned || bs.active.Load() {
+			continue
+		}
+		if now.Sub(bs.created) > bridgeLivenessTimeout {
+			bs.warned = true
+			log.Printf("discovery: bridge %q (%s) connected but received no traffic in %s — the far side is likely not running a bridge listener on that port, is filtered, or requires a bridge pre-shared key this node does not have", name, bs.addr, bridgeLivenessTimeout)
+		}
+	}
+}
+
 // AddBridge dials a transport node over TCP and adds it as an interface, so this
 // node's announces/path-requests reach — and remote ones arrive from — a network
 // the local broadcast domain cannot. Call before Start. This is how discovery
 // crosses subnets/the internet without DNS: point a bridge at one reachable node.
+// A bridge PSK, when set via SetBridgePSK, gates who may attach in either
+// direction; without one the bridge is open, which is what a public seed wants.
 func (d *Discovery) AddBridge(name, remoteAddr string) error {
-	tc, err := iface.NewTCPClientInterface(name, remoteAddr)
+	tc, err := iface.NewTCPClientInterfaceAuth(name, remoteAddr, d.bridgePSK())
 	if err != nil {
 		return err
 	}
 	d.ifaces = append(d.ifaces, tc)
+	d.registerBridge(name, remoteAddr)
 	return nil
 }
 
@@ -503,12 +652,57 @@ func (d *Discovery) AddBridge(name, remoteAddr string) error {
 // address runs this to become a bridge point. Returns the actual bound address
 // (useful when listenAddr uses port 0). Call before Start.
 func (d *Discovery) AddListenBridge(name, listenAddr string) (string, error) {
-	ts, err := iface.NewTCPServerInterface(name, listenAddr)
+	ts, err := iface.NewTCPServerInterfaceAuth(name, listenAddr, d.bridgePSK())
 	if err != nil {
 		return "", err
 	}
 	d.ifaces = append(d.ifaces, ts)
+	d.registerBridge(name, ts.Addr().String())
 	return ts.Addr().String(), nil
+}
+
+// AddAutoInterface joins the zero-config LAN multicast group so this node
+// discovers — and is discovered by — other SyncSwarm nodes on the same physical
+// network, with no bootstrap host or DNS seed. Call before Start. Returns
+// iface.ErrNoMulticast when the host has no multicast-capable interface (a
+// loopback-only container), which a caller should treat as "no LAN peering here"
+// rather than a fatal error.
+func (d *Discovery) AddAutoInterface(name string) error {
+	ai, err := iface.NewAutoInterface(name)
+	if err != nil {
+		return err
+	}
+	d.ifaces = append(d.ifaces, ai)
+	return nil
+}
+
+// AddLoRaInterface opens a serial-attached LoRa modem (RNode / Meshtastic /
+// MeshCore in KISS mode) at device and joins the mesh over the air — announces
+// and path requests flood over it like any broadcast medium. Call before Start.
+// baud 0 uses a sensible default. Returns an error if the device can't be opened
+// (or the platform has no serial backend).
+// dutyCycle limits transmissions to that fraction of wall time on air (e.g. 0.01
+// for the 1% common in licence-free sub-GHz bands); 0 disables the limit.
+func (d *Discovery) AddLoRaInterface(name, device string, baud int, dutyCycle float64) error {
+	li, err := iface.NewLoRaInterface(name, device, baud)
+	if err != nil {
+		return err
+	}
+	li.SetDutyCycle(dutyCycle, 0)
+	d.ifaces = append(d.ifaces, li)
+	return nil
+}
+
+// AddSerialInterface opens a KISS/serial radio modem (TNC, packet radio) at
+// device and joins the mesh over it. Call before Start. baud 0 uses a default.
+func (d *Discovery) AddSerialInterface(name, device string, baud int, dutyCycle float64) error {
+	si, err := iface.NewSerialInterface(name, device, baud)
+	if err != nil {
+		return err
+	}
+	si.SetDutyCycle(dutyCycle, 0)
+	d.ifaces = append(d.ifaces, si)
+	return nil
 }
 
 // --- small helpers ---------------------------------------------------------

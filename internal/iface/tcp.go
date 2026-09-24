@@ -2,11 +2,13 @@ package iface
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 // tcpMTU is the largest frame the TCP interfaces will send in one call. TCP is a
@@ -68,18 +70,30 @@ type TCPServerInterface struct {
 	closeOnce sync.Once
 	wg        sync.WaitGroup // acceptLoop + one per readConn; frames closed after all exit
 
+	psk []byte // optional bridge PSK; empty means an open bridge
+
 	mu    sync.RWMutex
 	conns map[string]*tcpConn // remoteAddr -> conn
 }
 
-// NewTCPServerInterface binds a TCP listener on listenAddr (e.g. ":64513").
+// NewTCPServerInterface binds a TCP listener on listenAddr (e.g. ":64513"),
+// accepting any peer that connects.
 func NewTCPServerInterface(name, listenAddr string) (*TCPServerInterface, error) {
+	return NewTCPServerInterfaceAuth(name, listenAddr, nil)
+}
+
+// NewTCPServerInterfaceAuth is NewTCPServerInterface with an optional pre-shared
+// key: when psk is non-empty, a peer must complete the mutual handshake before any
+// frame it sends is read, so only holders of the key can attach a bridge. An empty
+// psk leaves the bridge open (the default for a public seed).
+func NewTCPServerInterfaceAuth(name, listenAddr string, psk []byte) (*TCPServerInterface, error) {
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		return nil, fmt.Errorf("iface tcp-server: listen %q: %w", listenAddr, err)
 	}
 	s := &TCPServerInterface{
 		name:   name,
+		psk:    psk,
 		ln:     ln,
 		frames: make(chan InboundFrame, 256),
 		done:   make(chan struct{}),
@@ -151,17 +165,33 @@ func (s *TCPServerInterface) acceptLoop() {
 		if err != nil {
 			return // listener closed
 		}
-		tc := &tcpConn{c: conn}
-		addr := conn.RemoteAddr().String()
-		s.mu.Lock()
-		s.conns[addr] = tc
-		s.mu.Unlock()
+		// Authenticate off the accept path: a peer that connects and then stalls
+		// must not hold up everyone else's connections.
 		s.wg.Add(1)
-		go s.readConn(addr, tc)
+		go s.acceptOne(conn)
 	}
 }
 
-func (s *TCPServerInterface) readConn(addr string, tc *tcpConn) {
+// acceptOne completes the optional PSK handshake, then serves the connection. The
+// reader is created before the handshake and handed to readConn, so bytes the peer
+// pipelined behind its proof are not lost.
+func (s *TCPServerInterface) acceptOne(conn net.Conn) {
+	defer s.wg.Done()
+	r := bufio.NewReader(conn)
+	if err := bridgeAuthServer(conn, r, s.psk); err != nil {
+		conn.Close()
+		return
+	}
+	tc := &tcpConn{c: conn}
+	addr := conn.RemoteAddr().String()
+	s.mu.Lock()
+	s.conns[addr] = tc
+	s.mu.Unlock()
+	s.wg.Add(1)
+	s.readConn(addr, tc, r)
+}
+
+func (s *TCPServerInterface) readConn(addr string, tc *tcpConn, r *bufio.Reader) {
 	defer func() {
 		tc.c.Close()
 		s.mu.Lock()
@@ -169,7 +199,6 @@ func (s *TCPServerInterface) readConn(addr string, tc *tcpConn) {
 		s.mu.Unlock()
 		s.wg.Done()
 	}()
-	r := bufio.NewReader(tc.c)
 	for {
 		frame, err := readFrame(r)
 		if err != nil {
@@ -185,33 +214,71 @@ func (s *TCPServerInterface) readConn(addr string, tc *tcpConn) {
 
 // --- TCP client ------------------------------------------------------------
 
+// Reconnect backoff bounds for a dropped bridge.
+const (
+	reconnectMin = 1 * time.Second
+	reconnectMax = 30 * time.Second
+	dialTimeout  = 10 * time.Second
+)
+
 // TCPClientInterface dials a single known peer (a transport node) and keeps the
-// connection framed. This is the graceful replacement for a "bootstrap peer":
-// point it at one reachable node to bridge into a wider mesh over the internet.
-// v1 does not auto-reconnect; the core is expected to re-open on failure.
+// connection framed — the graceful replacement for a "bootstrap peer": point it
+// at one reachable node to bridge into a wider mesh over the internet. It
+// **auto-reconnects**: if the connection drops, it redials with exponential
+// backoff (keeping Frames() open across reconnects) until it succeeds or Close is
+// called, so a bridge self-heals after a transient outage.
 type TCPClientInterface struct {
 	name      string
-	remote    string
-	conn      *tcpConn
+	dialAddr  string
 	frames    chan InboundFrame
 	done      chan struct{}
 	closeOnce sync.Once
+	closed    chan struct{} // closed when the run loop has fully exited
+	ctx       context.Context
+	cancel    context.CancelFunc // cancels an in-flight redial on Close
+
+	psk []byte // optional bridge PSK; re-proven on every reconnect
+
+	mu     sync.Mutex
+	conn   *tcpConn      // current connection, or nil while (re)connecting
+	reader *bufio.Reader // buffered reader bound to conn
 }
 
-// NewTCPClientInterface dials remoteAddr (e.g. "relay.example.net:64513").
+// NewTCPClientInterface dials remoteAddr (e.g. "relay.example.net:64513"). The
+// first dial is synchronous so a misconfigured address fails fast; subsequent
+// drops are recovered automatically by the reconnect loop.
 func NewTCPClientInterface(name, remoteAddr string) (*TCPClientInterface, error) {
-	conn, err := net.Dial("tcp", remoteAddr)
+	return NewTCPClientInterfaceAuth(name, remoteAddr, nil)
+}
+
+// NewTCPClientInterfaceAuth is NewTCPClientInterface with an optional pre-shared
+// key. The handshake is mutual, so a non-empty psk also proves the far side is the
+// intended bridge and not an impostor on the same address. It is re-run on every
+// reconnect — a bridge that comes back must re-authenticate.
+func NewTCPClientInterfaceAuth(name, remoteAddr string, psk []byte) (*TCPClientInterface, error) {
+	conn, err := net.DialTimeout("tcp", remoteAddr, dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("iface tcp-client: dial %q: %w", remoteAddr, err)
 	}
-	c := &TCPClientInterface{
-		name:   name,
-		remote: conn.RemoteAddr().String(),
-		conn:   &tcpConn{c: conn},
-		frames: make(chan InboundFrame, 256),
-		done:   make(chan struct{}),
+	r := bufio.NewReader(conn)
+	if err := bridgeAuthClient(conn, r, psk); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("iface tcp-client: %q: %w", remoteAddr, err)
 	}
-	go c.readLoop()
+	ctx, cancel := context.WithCancel(context.Background())
+	c := &TCPClientInterface{
+		name:     name,
+		dialAddr: remoteAddr,
+		frames:   make(chan InboundFrame, 256),
+		done:     make(chan struct{}),
+		closed:   make(chan struct{}),
+		ctx:      ctx,
+		cancel:   cancel,
+		psk:      psk,
+		conn:     &tcpConn{c: conn},
+		reader:   r,
+	}
+	go c.run()
 	return c, nil
 }
 
@@ -223,35 +290,99 @@ func (c *TCPClientInterface) Caps() Caps {
 
 func (c *TCPClientInterface) Frames() <-chan InboundFrame { return c.frames }
 
-// Send writes to the single upstream connection; addr is ignored (there is one
-// peer), so both Send(Broadcast, …) and Send(remote, …) reach it.
+// Send writes to the current upstream connection; addr is ignored (single peer).
+// Returns an error while the bridge is mid-reconnect — callers that broadcast
+// treat that as best-effort.
 func (c *TCPClientInterface) Send(_ string, frame []byte) error {
 	select {
 	case <-c.done:
 		return ErrClosed
 	default:
 	}
-	return c.conn.send(frame)
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if conn == nil {
+		return fmt.Errorf("iface tcp-client: %s not connected (reconnecting)", c.dialAddr)
+	}
+	return conn.send(frame)
 }
 
 func (c *TCPClientInterface) Close() error {
 	c.closeOnce.Do(func() {
 		close(c.done)
-		c.conn.c.Close() // unblocks readLoop, which closes frames on exit
+		c.cancel() // abort any in-flight redial
+		c.mu.Lock()
+		if c.conn != nil {
+			c.conn.c.Close() // unblocks the current readConn
+		}
+		c.mu.Unlock()
 	})
+	<-c.closed // wait for run() to finish and close frames
 	return nil
 }
 
-func (c *TCPClientInterface) readLoop() {
-	defer close(c.frames) // sole sender closes the channel
-	r := bufio.NewReader(c.conn.c)
+// run reads from the current connection and, when it drops, redials with backoff
+// until reconnected or closed. It owns the frames channel (sole closer).
+func (c *TCPClientInterface) run() {
+	defer close(c.frames)
+	defer close(c.closed)
+	backoff := reconnectMin
+	for {
+		c.mu.Lock()
+		conn, reader := c.conn, c.reader
+		c.mu.Unlock()
+		if conn != nil {
+			c.readConn(reader) // blocks until the connection drops or we Close
+			backoff = reconnectMin
+		}
+
+		select {
+		case <-c.done:
+			return
+		default:
+		}
+
+		// Mark disconnected, then redial with backoff (abortable by Close).
+		c.mu.Lock()
+		c.conn, c.reader = nil, nil
+		c.mu.Unlock()
+		select {
+		case <-c.done:
+			return
+		case <-time.After(backoff):
+		}
+		if backoff *= 2; backoff > reconnectMax {
+			backoff = reconnectMax
+		}
+		nc, err := (&net.Dialer{Timeout: dialTimeout}).DialContext(c.ctx, "tcp", c.dialAddr)
+		if err != nil {
+			continue // stay in the loop, retry after the next backoff (or Close)
+		}
+		nr := bufio.NewReader(nc)
+		// Re-authenticate on every reconnect: a bridge that drops and returns has
+		// to prove itself again, and so do we. A failure here is treated like a
+		// failed dial — back off and retry, rather than silently running an
+		// unauthenticated bridge.
+		if err := bridgeAuthClient(nc, nr, c.psk); err != nil {
+			nc.Close()
+			continue
+		}
+		c.mu.Lock()
+		c.conn, c.reader = &tcpConn{c: nc}, nr
+		c.mu.Unlock()
+	}
+}
+
+// readConn reads framed messages from one connection until it errors.
+func (c *TCPClientInterface) readConn(r *bufio.Reader) {
 	for {
 		frame, err := readFrame(r)
 		if err != nil {
 			return
 		}
 		select {
-		case c.frames <- InboundFrame{Addr: c.remote, Data: frame}:
+		case c.frames <- InboundFrame{Addr: c.dialAddr, Data: frame}:
 		case <-c.done:
 			return
 		}

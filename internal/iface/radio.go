@@ -1,79 +1,70 @@
 package iface
 
-// Radio interfaces are stubs for now. v1 targets IP-ish media (UDP/TCP); these
-// lay the seam so that if the mesh model works well we can bridge SyncSwarm into
-// existing LoRa mesh ecosystems without reworking the core:
-//
-//   - Reticulum RNode  — a serial/USB LoRa transceiver speaking RNode framing;
-//     bridging here effectively makes SyncSwarm interoperable with Reticulum's
-//     physical layer.
-//   - Meshtastic       — LoRa mesh firmware; a bridge would ride its channels
-//     (likely via its serial/BLE protobuf API) as a low-bitrate interface.
-//   - MeshCore         — another LoRa mesh stack; same idea, different framing.
-//
-// Each will be a real Interface implementation once wired: framing a SyncSwarm
-// wire packet down to the medium's tiny MTU (~500 bytes), which is why Pillar 5
-// of RETICULUM_ALIGNMENT.md (MTU-driven sizing) is a prerequisite. Until then,
-// every method returns ErrNotImplemented and Frames() yields a closed channel so
-// callers degrade cleanly rather than block.
+import "fmt"
 
-// loRaMTU / serialMTU reflect typical LoRa payload and a conservative serial
-// frame, recorded now so MTU-driven sizing has real numbers to target.
+// Radio interfaces bridge SyncSwarm onto serial-attached LoRa modems using KISS
+// framing (see kiss.go), so a node can join a mesh over the air rather than IP:
+//
+//   - Reticulum RNode  — a serial/USB LoRa transceiver in KISS mode; this makes
+//     SyncSwarm ride Reticulum's physical layer.
+//   - Meshtastic / MeshCore — LoRa mesh firmware; usable as a low-bitrate
+//     interface when configured for KISS over serial.
+//
+// The medium is address-less broadcast RF: announces and path requests flood
+// over it exactly like UDP broadcast, which is all the connection-agnostic
+// discovery model needs. Frames are sized to the tiny radio MTU by the Link layer
+// (Pillar 5, Caps().MTU). A real serial device is opened by openSerial (Linux
+// today; other OSes return ErrNotImplemented) — the KISS engine itself is
+// OS-independent and also drives a networked RNode via NewKISSInterface.
+
+// loRaMTU / serialMTU are conservative per-frame payload caps: LoRa's airtime
+// budget keeps frames small, and a generic KISS TNC is similar.
 const (
 	loRaMTU   = 500
 	serialMTU = 500
+
+	// Common default line rates for the two roles (RNode enumerates fast; a
+	// classic TNC is slow). Callers may override.
+	defaultLoRaBaud   = 115200
+	defaultSerialBaud = 9600
 )
 
-// closedFrames is a pre-closed channel returned by stub interfaces so a caller
-// ranging over Frames() exits immediately instead of blocking forever.
-func closedFrames() <-chan InboundFrame {
-	ch := make(chan InboundFrame)
-	close(ch)
-	return ch
-}
-
-// LoRaInterface is a stub for a LoRa radio transport (Reticulum RNode /
-// Meshtastic / MeshCore bridge). Not yet implemented.
+// LoRaInterface is a LoRa radio transport over a serial-attached modem (RNode /
+// Meshtastic / MeshCore in KISS mode).
 type LoRaInterface struct {
-	name   string
-	device string // e.g. "/dev/ttyUSB0" or a BLE address — recorded for later
+	*kissInterface
 }
 
-// NewLoRaInterface records the target device but does not open it; the backend
-// is not implemented yet. It never fails, so wiring code can register a LoRa
-// interface today and light it up later.
-func NewLoRaInterface(name, device string) *LoRaInterface {
-	return &LoRaInterface{name: name, device: device}
+// NewLoRaInterface opens the serial LoRa modem at device (e.g. "/dev/ttyUSB0") at
+// baud (0 → a sensible default) and frames traffic over it with KISS. It fails if
+// the device cannot be opened or the platform has no serial backend.
+func NewLoRaInterface(name, device string, baud int) (*LoRaInterface, error) {
+	if baud <= 0 {
+		baud = defaultLoRaBaud
+	}
+	rwc, err := openSerial(device, baud)
+	if err != nil {
+		return nil, fmt.Errorf("iface lora: open %q: %w", device, err)
+	}
+	caps := Caps{MTU: loRaMTU, Bitrate: 5000, Broadcast: true, FullDuplex: false}
+	return &LoRaInterface{newKISSInterface(name, rwc, KindLoRa, caps)}, nil
 }
 
-func (l *LoRaInterface) Name() string { return l.name }
-func (l *LoRaInterface) Kind() Kind   { return KindLoRa }
-func (l *LoRaInterface) Caps() Caps {
-	return Caps{MTU: loRaMTU, Bitrate: 5000, Broadcast: true, FullDuplex: false}
-}
-func (l *LoRaInterface) Send(string, []byte) error   { return ErrNotImplemented }
-func (l *LoRaInterface) Frames() <-chan InboundFrame { return closedFrames() }
-func (l *LoRaInterface) Close() error                { return nil }
-
-// SerialInterface is a stub for a KISS/serial link to a radio modem (TNC, packet
-// radio). Not yet implemented.
+// SerialInterface is a KISS/serial link to a radio modem (TNC, packet radio).
 type SerialInterface struct {
-	name   string
-	device string
-	baud   int
+	*kissInterface
 }
 
-// NewSerialInterface records the serial device and baud rate but does not open
-// the port; the backend is not implemented yet.
-func NewSerialInterface(name, device string, baud int) *SerialInterface {
-	return &SerialInterface{name: name, device: device, baud: baud}
+// NewSerialInterface opens the serial device at baud (0 → a sensible default) and
+// frames traffic over it with KISS.
+func NewSerialInterface(name, device string, baud int) (*SerialInterface, error) {
+	if baud <= 0 {
+		baud = defaultSerialBaud
+	}
+	rwc, err := openSerial(device, baud)
+	if err != nil {
+		return nil, fmt.Errorf("iface serial: open %q: %w", device, err)
+	}
+	caps := Caps{MTU: serialMTU, Bitrate: baud, Broadcast: true, FullDuplex: false}
+	return &SerialInterface{newKISSInterface(name, rwc, KindSerial, caps)}, nil
 }
-
-func (s *SerialInterface) Name() string { return s.name }
-func (s *SerialInterface) Kind() Kind   { return KindSerial }
-func (s *SerialInterface) Caps() Caps {
-	return Caps{MTU: serialMTU, Bitrate: 9600, Broadcast: false, FullDuplex: false}
-}
-func (s *SerialInterface) Send(string, []byte) error   { return ErrNotImplemented }
-func (s *SerialInterface) Frames() <-chan InboundFrame { return closedFrames() }
-func (s *SerialInterface) Close() error                { return nil }

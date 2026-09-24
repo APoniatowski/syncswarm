@@ -32,12 +32,14 @@ func newTestDiscovery(selfID string) *Discovery {
 		selfID:         selfID,
 		ctx:            ctx,
 		cancel:         cancel,
-		pending:        make(map[uint64]chan time.Time),
+		pending:        make(map[uint64]pendingLatency),
 		observedCounts: make(map[string]int),
 		paths:          newPathTable(maxPaths),
 		seenAnn:        newDedupSet(announceDedupTTL),
+		routedSeen:     newDedupSet(announceDedupTTL),
 		nodeIface:      make(map[string]iface.Interface),
 		addrIface:      make(map[string]iface.Interface),
+		bridges:        make(map[string]*bridgeStat),
 	}
 }
 
@@ -56,7 +58,7 @@ func TestMergePeer_AddsNewPeer(t *testing.T) {
 		LastSeen:     now,
 	}
 
-	d.mergePeer(pi)
+	d.mergePeer(pi, false)
 
 	node, ok := d.nodes[id]
 	if !ok {
@@ -71,30 +73,55 @@ func TestMergePeer_AddsNewPeer(t *testing.T) {
 	if node.Port != pi.Port {
 		t.Errorf("Port = %d, want %d", node.Port, pi.Port)
 	}
-	if len(node.Capabilities) != 1 || node.Capabilities[0] != "relay" {
-		t.Errorf("Capabilities = %v, want [relay]", node.Capabilities)
+	// Capabilities must NOT come from gossip: the record is signed by the gossiper,
+	// not the subject, so honouring it let any member mark any node "relay". They
+	// are learned from the subject's own signed announce instead. (This assertion
+	// was inverted — it asserted the vulnerable behaviour; see SECURITY_AUDIT.md.)
+	if len(node.Capabilities) != 0 {
+		t.Errorf("Capabilities = %v, want none learned from gossip", node.Capabilities)
 	}
-	if !node.Active {
-		t.Errorf("expected new peer to be Active")
+	// A gossiped peer is a candidate, not a live peer: liveness is first-hand
+	// only, established when it answers our own authenticated latency check.
+	// Admitting it active would let a third party's claim put a (possibly dead)
+	// node into routing.
+	if node.Active {
+		t.Errorf("a gossip-discovered peer must start unverified, not Active")
 	}
 	if !node.LastSeen.Equal(now) {
 		t.Errorf("LastSeen = %v, want %v", node.LastSeen, now)
 	}
 }
 
-func TestMergePeer_RefreshesLastSeen(t *testing.T) {
+// TestMergePeer_GossipDoesNotAssertLiveness pins the rule that gossip carries no
+// evidence of liveness. Previously a gossiped record refreshed LastSeen and set
+// Active, so a dead node was resurrected indefinitely by whoever still gossiped
+// it — two peers could keep each other's stale entries alive forever, and an
+// entry marked active is eligible for routing, where traffic sealed to a departed
+// node's key is silently black-holed. Metadata may still be learned from gossip
+// (the ID/key binding is verified); liveness may not.
+func TestMergePeer_GossipDoesNotAssertLiveness(t *testing.T) {
 	d := newTestDiscovery("self")
 
 	id, signKey := boundID(t)
 	first := time.Now()
-	d.mergePeer(protocol.PeerInfo{NodeID: id, SignKey: signKey, Address: "a:1", LastSeen: first})
+	d.mergePeer(protocol.PeerInfo{NodeID: id, SignKey: signKey, Address: "a:1", LastSeen: first}, false)
+
+	// Simulate the peer having been verified first-hand, then going away.
+	d.nodes[id].Active = false
 
 	newer := first.Add(1 * time.Minute)
-	d.mergePeer(protocol.PeerInfo{NodeID: id, SignKey: signKey, Address: "a:1", LastSeen: newer})
+	d.mergePeer(protocol.PeerInfo{NodeID: id, SignKey: signKey, Address: "b:2", LastSeen: newer}, false)
 
 	node := d.nodes[id]
-	if !node.LastSeen.Equal(newer) {
-		t.Errorf("LastSeen = %v, want refreshed to %v", node.LastSeen, newer)
+	if node.Active {
+		t.Error("gossip resurrected a dead peer to Active")
+	}
+	if node.LastSeen.Equal(newer) {
+		t.Errorf("gossip advanced LastSeen to %v; it must reflect first-hand contact only", newer)
+	}
+	// Metadata is still safe to learn from gossip.
+	if node.Address != "b:2" {
+		t.Errorf("Address = %q, want the gossiped update %q", node.Address, "b:2")
 	}
 }
 
@@ -103,13 +130,13 @@ func TestMergePeer_RejectsUnboundIdentity(t *testing.T) {
 
 	// NodeID that does not match DeriveNodeID(SignKey) must be rejected.
 	_, signKey := boundID(t)
-	d.mergePeer(protocol.PeerInfo{NodeID: "spoofed-id", SignKey: signKey, Address: "x:1", LastSeen: time.Now()})
+	d.mergePeer(protocol.PeerInfo{NodeID: "spoofed-id", SignKey: signKey, Address: "x:1", LastSeen: time.Now()}, false)
 	if _, ok := d.nodes["spoofed-id"]; ok {
 		t.Fatal("mergePeer must reject a peer whose ID is not bound to its SignKey")
 	}
 
 	// Missing SignKey entirely is also rejected.
-	d.mergePeer(protocol.PeerInfo{NodeID: "no-key", Address: "y:1", LastSeen: time.Now()})
+	d.mergePeer(protocol.PeerInfo{NodeID: "no-key", Address: "y:1", LastSeen: time.Now()}, false)
 	if _, ok := d.nodes["no-key"]; ok {
 		t.Fatal("mergePeer must reject a peer with no SignKey")
 	}
@@ -118,7 +145,7 @@ func TestMergePeer_RejectsUnboundIdentity(t *testing.T) {
 func TestMergePeer_SkipsSelf(t *testing.T) {
 	d := newTestDiscovery("self")
 
-	d.mergePeer(protocol.PeerInfo{NodeID: "self", Address: "x:1", LastSeen: time.Now()})
+	d.mergePeer(protocol.PeerInfo{NodeID: "self", Address: "x:1", LastSeen: time.Now()}, false)
 
 	if _, ok := d.nodes["self"]; ok {
 		t.Errorf("mergePeer must not add the local node to the table")
@@ -130,10 +157,10 @@ func TestMergePeer_DoesNotRegressNewerLastSeen(t *testing.T) {
 
 	id, signKey := boundID(t)
 	newer := time.Now()
-	d.mergePeer(protocol.PeerInfo{NodeID: id, SignKey: signKey, Address: "new:1", LastSeen: newer})
+	d.mergePeer(protocol.PeerInfo{NodeID: id, SignKey: signKey, Address: "new:1", LastSeen: newer}, false)
 
 	older := newer.Add(-5 * time.Minute)
-	d.mergePeer(protocol.PeerInfo{NodeID: id, SignKey: signKey, Address: "old:1", LastSeen: older})
+	d.mergePeer(protocol.PeerInfo{NodeID: id, SignKey: signKey, Address: "old:1", LastSeen: older}, false)
 
 	node := d.nodes[id]
 	if !node.LastSeen.Equal(newer) {
@@ -246,7 +273,7 @@ func TestAntiEclipse_SubnetCap(t *testing.T) {
 	// Flood 50 distinct Sybil identities all in one /24.
 	for i := 1; i <= 50; i++ {
 		id, sk := boundID(t)
-		d.mergePeer(protocol.PeerInfo{NodeID: id, SignKey: sk, Address: fmt.Sprintf("10.0.0.%d:9000", i), LastSeen: time.Now()})
+		d.mergePeer(protocol.PeerInfo{NodeID: id, SignKey: sk, Address: fmt.Sprintf("10.0.0.%d:9000", i), LastSeen: time.Now()}, false)
 	}
 	count := 0
 	for _, n := range d.nodes {
@@ -260,7 +287,7 @@ func TestAntiEclipse_SubnetCap(t *testing.T) {
 
 	// An honest peer in a distinct subnet still gets in.
 	hid, hsk := boundID(t)
-	d.mergePeer(protocol.PeerInfo{NodeID: hid, SignKey: hsk, Address: "203.0.113.5:9000", LastSeen: time.Now()})
+	d.mergePeer(protocol.PeerInfo{NodeID: hid, SignKey: hsk, Address: "203.0.113.5:9000", LastSeen: time.Now()}, false)
 	if _, ok := d.nodes[hid]; !ok {
 		t.Fatal("honest peer in a distinct subnet must survive a same-subnet flood")
 	}
@@ -272,12 +299,12 @@ func TestAntiEclipse_BootstrapProtected(t *testing.T) {
 
 	// A bootstrap-host peer, deliberately stale.
 	bid, bsk := boundID(t)
-	d.mergePeer(protocol.PeerInfo{NodeID: bid, SignKey: bsk, Address: "10.0.0.1:64512", LastSeen: time.Now().Add(-time.Hour)})
+	d.mergePeer(protocol.PeerInfo{NodeID: bid, SignKey: bsk, Address: "10.0.0.1:64512", LastSeen: time.Now().Add(-time.Hour)}, false)
 
 	// Flood the same subnet with fresher Sybils.
 	for i := 2; i < 60; i++ {
 		id, sk := boundID(t)
-		d.mergePeer(protocol.PeerInfo{NodeID: id, SignKey: sk, Address: fmt.Sprintf("10.0.0.%d:9000", i), LastSeen: time.Now()})
+		d.mergePeer(protocol.PeerInfo{NodeID: id, SignKey: sk, Address: fmt.Sprintf("10.0.0.%d:9000", i), LastSeen: time.Now()}, false)
 	}
 	if _, ok := d.nodes[bid]; !ok {
 		t.Fatal("bootstrap trust anchor must never be evicted by a Sybil flood")
@@ -299,13 +326,17 @@ func TestPeerHealthComposition(t *testing.T) {
 			SignKey:  signKey,
 			Port:     9000,
 			LastSeen: time.Now(),
-		})
+		}, false)
 		return id
 	}
 
-	add("10.0.0.1:64512")             // subnet 10.0.0.0/24
-	add("10.0.0.2:64512")             // subnet 10.0.0.0/24
+	// mergePeer admits gossiped peers as unverified, so mark the two we want to
+	// count as active the way a first-hand latency check would.
+	a1 := add("10.0.0.1:64512")       // subnet 10.0.0.0/24
+	a2 := add("10.0.0.2:64512")       // subnet 10.0.0.0/24
 	inactive := add("10.0.1.9:64512") // subnet 10.0.1.0/24
+	d.nodes[a1].Active = true
+	d.nodes[a2].Active = true
 	d.nodes[inactive].Active = false
 
 	h := d.PeerHealth()

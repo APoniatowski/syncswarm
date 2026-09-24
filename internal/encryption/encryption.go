@@ -45,7 +45,7 @@ var (
 // side effects happen at package import time and the location is chosen by the
 // caller rather than a hardcoded root-owned path.
 func GenerateKeys(dir string, bitSize int) error {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil { // holds the RSA private key
 		return err
 	}
 
@@ -74,7 +74,7 @@ func GenerateKeys(dir string, bitSize int) error {
 			Bytes: publicKeyBytes,
 		},
 	)
-	if err := os.WriteFile(dir+"/public_key.pem", publicKeyPEM, 0o644); err != nil {
+	if err := os.WriteFile(dir+"/public_key.pem", publicKeyPEM, 0o644); err != nil { // #nosec G306 -- public key, world-readable by design
 		return err
 	}
 

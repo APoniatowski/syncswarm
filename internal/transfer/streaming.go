@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"io"
+	"sort"
 	"sync"
 	"time"
 
@@ -113,7 +114,7 @@ func (t *Transfer) SendStream(r io.Reader, destNode string) error {
 
 	var sendErr error
 	sentForwarded := false
-	if t.hopCount > 0 && t.nodePriv != nil && len(dest.PubKey) > 0 {
+	if t.wantForward() && t.nodePriv != nil && len(dest.PubKey) > 0 {
 		// Only commit to the forwarded path when a route can actually be built.
 		// r is a single-pass reader, so we cannot start streaming forwarded and
 		// then retry direct once bytes are consumed; if there are no eligible
@@ -125,10 +126,11 @@ func (t *Transfer) SendStream(r io.Reader, destNode string) error {
 		}
 	}
 	if !sentForwarded {
-		// Strict anonymity: refuse to degrade an anonymous stream to a direct one
-		// (which would reveal the sender) when no forwarded route could be built.
-		if t.strictAnon && t.hopCount > 0 {
-			return fmt.Errorf("strict anonymity: no relay route to %s for %d hops", destNode, t.hopCount)
+		// Fail-closed anonymity (strict or adaptive): refuse to degrade an
+		// anonymous stream to a direct one (which would reveal the sender) when no
+		// forwarded route could be built.
+		if t.failClosed() {
+			return fmt.Errorf("anonymity required but no relay route to %s (insufficient relays/diversity): %w", destNode, ErrNoAnonymousRoute)
 		}
 		sendErr = t.streamDirect(dest, id, sc, r, sealer)
 	}
@@ -570,4 +572,53 @@ func (sa *streamAssembler) reconstructBlock(b *streamBlock) ([]byte, error) {
 // reusing the shared sub-chunk logic over a single block's buffers.
 func absorbStreamPiece(b *streamBlock, pkt *protocol.Packet) (idx uint32, payload []byte, ok bool) {
 	return absorbSubChunk(b.received, b.subParts, pkt)
+}
+
+// maxRetainedStreams bounds how many interrupted resumable streams are held
+// awaiting a resume. The TTL alone does not bound them: retention deliberately
+// survives the connection that created it, so an unauthenticated peer can connect,
+// declare a resumable stream, disconnect, and repeat — accumulating state for the
+// whole hour rather than for the life of a connection. This is the ceiling on that.
+const maxRetainedStreams = 512
+
+// lastSeen reports when this stream last absorbed a fragment.
+func (sa *streamAssembler) lastSeen() time.Time {
+	sa.mu.Lock()
+	defer sa.mu.Unlock()
+	return sa.lastActivity
+}
+
+// enforceRetainedStreamCap keeps the number of retained resumable partials under
+// maxRetainedStreams, discarding the least recently active first.
+//
+// Evicting the oldest — rather than refusing to retain new ones — matters: a peer
+// that filled the table could otherwise block every genuine resume that followed,
+// turning the safeguard into the denial of service it exists to prevent. A real
+// resume is normally prompt, so the least recently active partial is the one least
+// likely to be waiting for anybody.
+func (t *Transfer) enforceRetainedStreamCap() {
+	type entry struct {
+		key  any
+		seen time.Time
+	}
+	var retained []entry
+	t.transfers.Range(func(key, value any) bool {
+		st, ok := value.(*transferState)
+		if ok && st.scheme.Resumable && st.stream != nil {
+			retained = append(retained, entry{key: key, seen: st.stream.lastSeen()})
+		}
+		return true
+	})
+	if len(retained) <= maxRetainedStreams {
+		return
+	}
+	sort.Slice(retained, func(i, j int) bool { return retained[i].seen.Before(retained[j].seen) })
+	for _, e := range retained[:len(retained)-maxRetainedStreams] {
+		if v, ok := t.transfers.Load(e.key); ok {
+			if st, ok := v.(*transferState); ok && st.stream != nil {
+				st.stream.abandonIfIdle(time.Now()) // close the sink, do not deliver
+			}
+		}
+		t.transfers.Delete(e.key)
+	}
 }

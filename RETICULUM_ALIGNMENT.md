@@ -108,8 +108,65 @@ media have ~500-byte MTUs.
   (latency, gossip, findnode query + reply) via `ifaceFor(nodeID)`, falling back to the
   primary UDP interface for unknown nodes — so non-bridged behavior is unchanged. Proven
   by `TestBridge_UnicastCrossesBridge` (a latency check + reply round-trips over the TCP
-  bridge, no shared UDP domain). *Follow-ups: precise bridged data-path addressing
-  (Transfer/Link layer) and bridge auto-reconnect remain.*
+  bridge, no shared UDP domain).
+- **Bridge auto-reconnect — landed.** `TCPClientInterface` now self-heals: on a dropped
+  connection it redials the same address with exponential backoff (1s → 30s), keeping
+  `Frames()` open across reconnects, until it reconnects or is closed. `Close` cancels an
+  in-flight redial so it never hangs. Composes with the liveness warning (a bridge that
+  reconnects resumes carrying frames; one that never can keeps warning). Tested:
+  `TestTCPClient_Reconnects`, `TestTCPClient_CloseWhileReconnecting`. *Follow-up:
+  precise bridged data-path addressing (Transfer/Link layer) remains.*
+- **Phase 4 — zero-config LAN (`AutoInterface`) landed.** `iface.AutoInterface`
+  joins a fixed IPv6 link-local multicast group (`ff02::7377`, port 64520) on every
+  eligible interface, so nodes on one physical network discover each other with no
+  bootstrap host, DNS seed, or broadcast-address config — the analogue of Reticulum's
+  AutoInterface. Additive: it's just another `Interface` in `Discovery.ifaces`, so
+  announces/path-requests fan out over it like any medium. Opt in via
+  `Options.AutoInterface` or `relay -auto`; `ErrNoMulticast` on a loopback-only host
+  is non-fatal (skipped). `Discovery.AddAutoInterface`. Self-received frames are
+  harmless (announces are self-signed; the node ignores its own NodeID). *Follow-up:
+  IPv4 multicast fallback for v6-less LANs, and constant-rate LAN announce shaping.*
+- **Phase 5 — MTU-driven sizing landed (radio still stubbed).** Each `Interface`
+  advertises a real sizing MTU via `Caps().MTU`, and the Link message layer sizes
+  its chunks to the transport a peer is reached over (`Manager.SetMTUFunc` →
+  `Discovery.mtuFor` → `addrIface[addr].Caps().MTU`), so a datagram/radio link no
+  longer emits IP-fragmenting frames — proven by `TestSendMessage_FrameFitsMTU`
+  (every on-wire frame fits a 1400-byte MTU and still reassembles). The UDP
+  interface now separates its **advertised** fragmentation-safe MTU
+  (`iface.SafeDatagramMTU` = 1400) from a **hard send cap** (65507), so payload
+  sizing targets the safe MTU while large legacy gossip is still accepted
+  (`NewUDPInterfaceSized`). A message too large for the 16-bit chunk index at a
+  small MTU is rejected with a clear error rather than silently truncating (the
+  streaming/Resource layer is Phase 0b). *Follow-up: derive the data-plane
+  (`SubChunkSize`) from the path MTU too.*
+- **Radio interfaces lit up (LoRa / serial over KISS).** `iface` now speaks
+  **KISS framing** (`kiss.go`) over any byte-stream link, the standard a Reticulum
+  RNode — and Meshtastic / MeshCore in KISS mode — exposes. `LoRaInterface` /
+  `SerialInterface` open a serial modem (`NewSerialInterface` / `NewLoRaInterface`;
+  POSIX termios opener on Linux, the usual LoRa SBC host — other OSes return
+  `ErrNotImplemented`), and `NewKISSInterface` wraps an already-open transport
+  (e.g. a TCP link to a networked RNode) on any OS. The medium is address-less
+  broadcast RF: inbound frames carry an empty Addr and announces/path-requests
+  flood over it exactly like UDP broadcast, so a node joins the mesh **over the air
+  with no IP at all** — the connection-agnostic north star. Wired via
+  `Options.LoRaDevice`/`SerialDevice` and `relay -lora`/`-serial`;
+  `Discovery.AddLoRaInterface`/`AddSerialInterface`. KISS framing (escaping,
+  resync) and the interface (both directions over a pipe) are tested without
+  hardware. **Darwin serial backend landed** (`serial_darwin.go`, BSD termios:
+  TIOCGETA/TIOCSETA, speeds in Ispeed/Ospeed), so Linux *and* macOS open a local
+  modem; other platforms (notably Windows, whose serial API differs entirely) still
+  return `ErrNotImplemented` and reach a networked RNode over TCP instead — all
+  three targets cross-compile in CI. **Duty-cycle limiting landed** (`duty.go`):
+  licence-free sub-GHz bands cap transmit airtime (EU 868 MHz typically 1%), so
+  `SetDutyCycle(fraction, window)` bounds airtime over a sliding window (estimated
+  from the medium's bitrate, counting the fully-escaped on-wire frame) and `Send`
+  returns `ErrDutyCycleExceeded` rather than transmitting over budget — back
+  pressure, not a fault, since discovery broadcasts are best-effort and simply
+  re-sent next tick. Wired via `Options.LoRaDutyCycle`/`SerialDutyCycle` and
+  `relay -lora-duty`/`-serial-duty`; 0 = unlimited (default). Tested in
+  `duty_test.go` (budget, refusal, window recovery, enforcement through `Send`).
+  This closes the last piece of Phase 5. *Follow-up: a Windows serial backend, and
+  modem-reported airtime instead of a bitrate estimate.*
 - **Link/session primitive — landed (`internal/link`).** The Reticulum Link, built as
   a self-contained, transport-agnostic package (the same "seam first, wire later"
   approach as `internal/iface`). A `Manager` establishes ephemeral encrypted sessions
@@ -145,6 +202,26 @@ media have ~500-byte MTUs.
   confirms/retries). **Remaining:** ride Links for the *streaming/erasure-coded/onion*
   transfer paths (needs a reliability/Resource layer on Links and per-hop routing) and
   link reuse/caching; and optionally split interface ownership into a frame router.
+- **Adaptive onion hops — landed (Pillar 3 enhancement).** `Options.AdaptiveOnionHops`
+  (+ `MinOnionHops`/`MaxOnionHops`) chooses the onion path length *per send* from relay
+  diversity — `routing.AdaptiveHops` counts **distinct-subnet** eligible relays (0→fail,
+  1→1, 2–3→2, 4+→3, cap 3) so a send is "as anonymous as the swarm currently allows".
+  Always **fail-closed**: below the floor it errors, never a silent direct send. Lives
+  entirely in the onion source-routing branch (doesn't touch the per-hop/path-table
+  tension); deliberately *not* named `HopCount` (distinct from the announce hop counter).
+  Threaded through `newForwardCtx`/`buildReplyBlock`; unit-tested (routing math) +
+  fail-closed integration test.
+- **Tiered fast-path routing — landed.** Onion relay selection
+  (`routing.BuildPathTiered`) now spreads load across the **fast half** of a node's
+  relays (median latency split, computed per-node so paths stay regional with no
+  global topology map) with **seeded per-copy shuffling** (spread + unpredictable,
+  not a single deterministic "quickest" path), keeps one-relay-per-subnet diversity,
+  places **seed hosts last** (a seed serves bootstrap, not general traffic), and
+  **biases the exit hop toward the destination** via its advertised `RelayIDs` (#3,
+  free — no new advertise field) so fragments don't take absurd detours. Wired into
+  the forwarded send path; unit-tested (fast-half, seeds-last, exit-bias, subnet
+  diversity, determinism). Per-profile weighting (looser for `Anonymous`) is a future
+  refinement; the pool+shuffle is anonymity-safe for all profiles today.
 - **Phase 0b — Transfer — deliberately deferred.** `Transfer` is connection-oriented
   (`Accept` → `handleConnection` streams many packets + acks over one conn; `net.Dial`
   + connection pool + held circuit reservations). That does not fit the frame-oriented
@@ -362,9 +439,36 @@ both modules.
 - **Phase 2 — Path requests. ✅ DONE.** `PacketTypePathRequest` + `RequestPath` /
   `ResolvePath`; dest-answers or transport-re-announces-cached-path; wired into
   `transfer.resolveDest` (DHT then path request). Unit-tested under -race.
-- **Phase 3 — Routing modes per profile.** Thread routing-mode from `Profile`;
-  per-hop for Direct/Balanced, onion unchanged for Anonymous; assert the
-  Anonymous-no-path-table invariant in tests.
+- **Phase 3 — Routing modes per profile. ✅ shipped.** Per-hop **transport
+  forwarding** landed in `discovery` (`internal/discovery/
+  routed.go`): `PacketTypeRouted` carries a content-sealed blob toward a destination;
+  transport nodes forward it one hop at a time via their announce path table
+  (`routeToward` → `PathTo` next hop over the learned interface), decrementing a hop
+  limit, with per-packet dedup for loop suppression; the destination delivers via
+  `SetRoutedHandler`. Dispatched before the signature gate (forwarding mutates the hop
+  limit; content is sealed end to end). Endpoints never forward; only `relay`-capable
+  transports do. Unit-tested (`routed_test.go`: deliver / forward+decrement / endpoint-
+  drop / hop-exhaust / dedup / no-path). **Per-profile wiring done:**
+  `transfer.sendRouted` seals fragments (the same inner bytes the onion path builds)
+  and hands them to `SendRouted`; the destination ingests them via the shared
+  `ingestForwardedFragment` (reassembly/RS/dedup reused). `Transfer.usePerHop()` gates
+  it OFF whenever anonymity is required (`strictAnon`/`adaptiveOnion`), so
+  **ProfileAnonymous always keeps onion source-routing** — the invariant, asserted by
+  `TestUsePerHop_GatedByAnonymity`. Falls back to onion/direct when no path is known.
+  Opt-in via `Options.PerHopRouting`; proven end to end by `TestPerHopRouting` (routed
+  hop in the trace + delivery over a bridge). Onion (source-routed) is unchanged and
+  stays the Anonymous path. **ConfirmDelivery over routed** landed: the destination
+  routes a signed delivery ack back through the path table (`sendRoutedAck` →
+  `ingestRoutedFragment` → `signalAckFrom`), so a confirmed per-hop send blocks until
+  acknowledged (`TestPerHopRouting_ConfirmDelivery`). **Routed sub-chunks are
+  MTU-sized** (data-plane analogue of the Link MTU chunking): the routed wire is
+  compact binary (`EncodeRouted`, hop limit decremented in place — no re-encode per
+  hop, no base64), and `routedSubChunkSize` caps each sub-chunk by
+  `Discovery.MTUToward(dest)` minus the two packet-layer overheads, so a routed frame
+  fits the (first-hop) path MTU — `TestRoutedFrameFitsMTU`, `TestRoutedFrameOverhead`.
+  *Follow-up: routed over a sub-500-byte LoRa link needs leaner (single-layer) framing
+  — the double Packet header exceeds that MTU; and multi-hop path-MTU discovery beyond
+  the first hop.*
 - **Phase 4 — `AutoInterface` (zero-config LAN).** IPv6 link-local multicast interface
   → two SDK apps on the same network discover each other with no config at all.
 - **Phase 5 — MTU-driven sizing + first radio interface.** Drive all transport sizes

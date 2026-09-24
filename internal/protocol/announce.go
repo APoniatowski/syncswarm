@@ -19,11 +19,18 @@ type AnnouncePayload struct {
 	MLKEMPub     []byte   // optional ML-KEM-768 public key (post-quantum sealing)
 	Port         uint16   // data port for direct dialing / reachability
 	Capabilities []string // e.g. "relay"
-	AppData      []byte   // small application hint (opaque here)
-	Timestamp    int64    // announcer's Unix-nano clock; signed (freshness/anti-replay)
-	Nonce        uint64   // random; makes (DestHash,Nonce) a flood-dedup key
-	HopCount     uint8    // MUTABLE, NOT signed: hops travelled so far
-	Signature    []byte   // Ed25519 over signedBytes()
+	// RelayIDs are the NodeIDs of relays this node holds circuit reservations
+	// with — how a NAT'd node says "reach me through these". It is signed, so it
+	// stays attributable to the announcer no matter how many hops re-forward it.
+	// That is the point: it previously travelled only in peer-exchange gossip,
+	// which is signed by the gossiper rather than the subject, letting any member
+	// name itself as anyone's reservation relay (SECURITY_AUDIT.md finding 2).
+	RelayIDs  []string
+	AppData   []byte // small application hint (opaque here)
+	Timestamp int64  // announcer's Unix-nano clock; signed (freshness/anti-replay)
+	Nonce     uint64 // random; makes (DestHash,Nonce) a flood-dedup key
+	HopCount  uint8  // MUTABLE, NOT signed: hops travelled so far
+	Signature []byte // Ed25519 over signedBytes()
 }
 
 // PathRequestPayload is the body of a PacketTypePathRequest: a query asking the
@@ -63,6 +70,20 @@ func (a *AnnouncePayload) signedBytes() []byte {
 		putStr(c)
 	}
 	putBytes(a.AppData)
+
+	// RelayIDs is appended only when non-empty, which keeps the encoding
+	// bit-identical to the pre-RelayIDs format for every announce that carries
+	// none. A node that publishes no reservations therefore stays mutually
+	// verifiable with older peers in both directions; only an announce that
+	// actually carries RelayIDs is unverifiable to a peer too old to know the
+	// field. That is the narrow, self-limiting break: it affects exactly the
+	// NAT'd nodes that older peers could not route to anyway.
+	if len(a.RelayIDs) > 0 {
+		putLen(len(a.RelayIDs))
+		for _, r := range a.RelayIDs {
+			putStr(r)
+		}
+	}
 
 	var u64 [8]byte
 	binary.BigEndian.PutUint64(u64[:], uint64(a.Timestamp))

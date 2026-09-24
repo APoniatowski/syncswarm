@@ -11,7 +11,17 @@ import (
 )
 
 // maxFrameSize bounds a single length-prefixed packet frame on a stream.
-const maxFrameSize = 64 << 20 // 64 MiB
+// maxFrameSize caps a single wire frame. The body is allocated from the declared
+// length *before* any of it arrives, so this number is exactly how much memory
+// four attacker-controlled bytes can commit on an unauthenticated connection —
+// the packet that identifies a peer is itself read through here.
+//
+// It is derived from what a legitimate frame needs rather than picked round: the
+// largest is one fragment at transfer.maxSubChunkSize (4 MiB) plus keys,
+// signature, reply block and padding, so 8 MiB leaves generous headroom. It was
+// 64 MiB, which bought an attacker a 16x multiplier over anything real for the
+// price of a 4-byte header.
+const maxFrameSize = 8 << 20 // 8 MiB
 
 var errMalformedPacket = errors.New("protocol: malformed packet")
 
@@ -258,7 +268,69 @@ const (
 	// PacketTypeLinkData (16) carries AEAD-encrypted application data over an
 	// established Link, addressed by link ID.
 	PacketTypeLinkData
+
+	// PacketTypeRouted (17) is a per-hop transport-forwarded packet: transport
+	// nodes forward it toward DestNode using their announce path tables (no
+	// source-routed onion), decrementing a hop limit, until it reaches the
+	// destination. Its payload is content-sealed end to end, so intermediaries
+	// route by destination but cannot read the content. Used only by the
+	// non-anonymous profiles; ProfileAnonymous keeps onion source-routing.
+	//
+	// The payload is a compact binary frame: the first byte is the hop limit
+	// (decremented in place at each hop, so no re-encoding is needed to forward),
+	// and the rest is the opaque content-sealed inner bytes delivered to the
+	// destination. Kept binary (not JSON) so a hop's frame stays close to the inner
+	// size and can be MTU-sized without base64 expansion. See EncodeRouted /
+	// RoutedHopLimit / RoutedInner.
+	PacketTypeRouted
+
+	// PacketTypeRoutedDiscovery (18) carries a signed *discovery* packet toward a
+	// non-adjacent peer using the same per-hop transport routing as
+	// PacketTypeRouted, and shares its payload encoding.
+	//
+	// It exists because a bridge cannot address anything but its own far end. An
+	// interface-based unicast (`ifaceFor(nodeID).Send(addr, …)`) writes to the
+	// bridge's single connection and ignores the address, so a latency check aimed
+	// at a distant peer is delivered to the *bridge peer*, which answers as itself.
+	// Identity-bound liveness correctly rejects that reply, so peers learned
+	// through a bridge could never be verified at all — making `-bridge` a
+	// discovery-flood mechanism rather than a transport. Routing the unicast by
+	// destination instead of by interface is the fix.
+	//
+	// The inner bytes are a marshalled, signed protocol.Packet, so the destination
+	// verifies the original sender's signature exactly as it would on a direct
+	// datagram; intermediaries cannot forge one.
+	PacketTypeRoutedDiscovery
 )
+
+// EncodeRouted builds a routed packet payload: hop limit byte followed by the
+// content-sealed inner bytes.
+func EncodeRouted(hopLimit uint8, inner []byte) []byte {
+	return append([]byte{hopLimit}, inner...)
+}
+
+// RoutedHopLimit reports the hop limit of a routed payload (0 if malformed).
+func RoutedHopLimit(payload []byte) uint8 {
+	if len(payload) == 0 {
+		return 0
+	}
+	return payload[0]
+}
+
+// RoutedInner returns the content-sealed inner bytes of a routed payload.
+func RoutedInner(payload []byte) []byte {
+	if len(payload) == 0 {
+		return nil
+	}
+	return payload[1:]
+}
+
+// RoutedFrameOverhead is the fixed on-wire cost, beyond the inner bytes, of a
+// routed packet: the marshaled Packet header (node-id fields, timestamp, length
+// prefixes) plus the 1-byte hop limit. Measured at ~189 bytes for an empty inner
+// payload (TestRoutedFrameOverhead) and rounded up for margin; used to size the
+// inner sub-chunk so a routed frame fits a path MTU.
+const RoutedFrameOverhead = 256
 
 // Packet represents the basic unit of data transmission in SyncSwarm
 type Packet struct {
@@ -360,13 +432,18 @@ type DiscoveryPayload struct {
 
 // PeerInfo is a node's advertised routing/identity record, shared via gossip.
 type PeerInfo struct {
-	NodeID       string
-	Address      string   // host:port the node is reachable at
-	PubKey       []byte   // X25519 public key (raw)
-	SignKey      []byte   // Ed25519 public key; NodeID must equal DeriveNodeID(SignKey)
-	Port         uint16   // transfer/data port the node listens on
-	Capabilities []string // e.g. ["relay"]
-	RelayIDs     []string // NodeIDs of relays this node holds circuit reservations with
+	NodeID  string
+	Address string // host:port the node is reachable at
+	PubKey  []byte // X25519 public key (raw)
+	SignKey []byte // Ed25519 public key; NodeID must equal DeriveNodeID(SignKey)
+	Port    uint16 // transfer/data port the node listens on
+	// Capabilities and RelayIDs are NOT trusted on receipt: a peer-exchange record
+	// is signed by the gossiper, not by its subject, so these are that peer's
+	// unattested claim about a third party. Both are authoritative only in the
+	// signed AnnouncePayload. They remain here for a sender's own entry and for
+	// compatibility with peers predating that change. See SECURITY_AUDIT.md.
+	Capabilities []string // e.g. ["relay"] — advisory only
+	RelayIDs     []string // reservation relays — advisory only
 	MLKEMPub     []byte   // optional ML-KEM-768 public key for post-quantum hybrid sealing
 	LastSeen     time.Time
 }

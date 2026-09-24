@@ -4,7 +4,10 @@ Living document owned by the **security-auditor** agent. It describes what
 SyncSwarm protects, against whom, by what mechanism, and — importantly — the
 gaps that remain. Update it whenever `protocol`, `discovery`, `transfer`, or
 `encryption` change. Every release should pass a `/security-review` against this
-document (see `ROADMAP.md`).
+document (see `ROADMAP.md`); an automated proxy for it runs on every push — the
+CI `security` job (`govulncheck` + `gosec` + the threat-model invariant tests),
+which blocks the release/mirror on any failure. A human `/security-review` still
+belongs before a tagged release.
 
 Status reflects the code as of Round 6c.
 
@@ -17,7 +20,7 @@ Status reflects the code as of Round 6c.
 | **Message content** | Confidentiality + integrity to the intended recipient only. |
 | **Sender identity/location** | Unlinkable to a message by relays and by the recipient. |
 | **Recipient identity** | Known to the sender (it addresses them), hidden from on-path relays. |
-| **Node identity** | Unforgeable; a node cannot impersonate another. |
+| **Node identity** | Unforgeable; a node cannot impersonate another. Liveness is identity-bound: a latency reply only counts if its authenticated signer is the node that was probed, so a different node answering at the same address cannot keep a stale identity alive (see "ghost peers" below). |
 | **Peer table / routing view** | Not poisonable with spoofed `(NodeID, key)` pairs. |
 | **Delivery confirmation** | Not forgeable by third parties (can't falsely stop resends). |
 
@@ -90,6 +93,56 @@ is), and **A5** (key compromise is game over for that node's traffic).
 
 ## 5. Known gaps / residual risks (prioritized)
 
+0. **"Ghost peers" — fixed, but worth recording.** Liveness checks used to match a
+   latency reply on its nonce alone, never comparing the responder's authenticated
+   signer against the node being probed. A node whose identity changed (storage
+   wiped, host re-provisioned) therefore left a stale table entry that its own
+   *successor* kept marking active by replying at the same address. Because path
+   selection seals onion layers to a hop's advertised public key, a ghost chosen as
+   a hop produced traffic the live node could not peel — a silent black hole rather
+   than an error. Found by inspecting a live two-relay deployment, where one host
+   appeared under two NodeIDs at one address. Replies are now identity-bound
+   (`pendingLatency`), so a ghost fails its checks and ages out. The residual worth
+   noting: an attacker who takes over a departed node's IP address can still
+   *deny* rather than impersonate — they cannot forge that node's key-derived ID,
+   but they can absorb traffic addressed to its address. Relay scoring
+   (unforgeable forwarding challenges) is the backstop.
+
+   A second vector of the same class was found alongside it: **gossip asserted
+   liveness**. `mergePeer` set `Active = true` and advanced `LastSeen` from a
+   peer-exchange record — a third party's claim — so a dead node was resurrected
+   indefinitely by whoever still gossiped it (two peers could keep each other's
+   stale entries alive forever), and the entry stayed eligible for routing. Key
+   binding was always enforced there, so gossip could never inject a *spoofed*
+   identity; it could assert liveness for a real identity that was gone. Gossip
+   now contributes candidates and metadata only: a peer becomes active solely by
+   answering this node's own authenticated latency check.
+
+   A third vector was found the same way, on live infrastructure: **DHT contact
+   lists asserted liveness**. `learnContacts` folded `FIND_NODE` results straight
+   into the node table as active, so each 30s DHT refresh re-activated exactly the
+   peers the latency round had just demoted — observed as a relay's active count
+   oscillating 8 -> 16 -> 13 -> 1 with only one peer ever actually measured. Key
+   binding was enforced there too, so again: no spoofed identity, but liveness
+   from a third party.
+
+   All three are now funnelled through one chokepoint, `upsertNode(..., verified)`:
+   `updateNode` (verified) is reachable only from the three paths that carry
+   first-hand proof — a Discovery, LatencyCheck, or FindNode packet whose payload
+   identity equals its authenticated signer — while `learnCandidate` (unverified)
+   serves hearsay. `FindNode` verifies on demand and reports a located-but-
+   unreachable node as *not found*, rather than returning a peer whose traffic
+   would be silently black-holed. The general rule, across every vector:
+   **liveness must be first-hand.**
+
+   *Remaining hearsay path (deliberately untouched):* `handleAnnounce` learns a
+   flooded announce as a live peer, and records the *forwarder's* address for a
+   re-flooded one. Tightening it interacts badly with identity-bound liveness — a
+   probe to the forwarder's address is answered by the forwarder, whose signature
+   no longer matches, so a multi-hop-announced node could never verify and would
+   sit permanently unusable. Announces are the backbone of connection-agnostic
+   discovery, so this needs a design pass (probe the announced address rather than
+   the last hop), not a patch.
 1. **Sybil/eclipse resistance is partial** *(Round 9 shipped)* — subnet-diverse
    relay selection, per-subnet/total peer-table caps, bootstrap trust anchors,
    gossip flood caps, and availability scoring (unforgeable forwarding challenges

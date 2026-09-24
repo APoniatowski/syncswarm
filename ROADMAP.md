@@ -9,6 +9,21 @@ Ordering principle: **reachability and authenticated identity first** (the
 difference between "LAN toy" and "usable on the internet"), then **anonymity
 hardening** (the difference between "confidential" and "anonymous").
 
+## Future planning (design docs, not on the immediate build path)
+
+- **[ADAPTIVE_RELIABILITY.md](ADAPTIVE_RELIABILITY.md)** — adaptive redundancy is
+  shipped; loss-driven **adaptive parity** (binomial-tail solver + a reliability
+  estimator) is designed and staged until there is loss telemetry to drive it.
+- **[DECENTRALIZED_BOOTSTRAP.md](DECENTRALIZED_BOOTSTRAP.md)** — a signed, M-of-N,
+  self-propagating **seed list** so no single machine (the author's included) stays
+  load-bearing. Phase A shipped (peer cache + `DefaultSeeds` + key-binding); Phases B–D
+  are planned for once the network grows and independent operators exist.
+- **[PHASE_0B.md](PHASE_0B.md)** — the last large architectural piece: move the data
+  plane off raw TCP onto the `internal/link` session layer, with a **Resource /
+  reliability layer** (selective ARQ, windowing, ordering) on top, and onion multi-hop
+  over per-hop Links preserving the anonymity invariant. Scoped into additive
+  sub-phases (0b.1–0b.4) so the TCP path stays green until the very end.
+
 ---
 
 ## ✅ Shipped
@@ -39,8 +54,14 @@ hardening** (the difference between "confidential" and "anonymous").
   bound to the destination's Ed25519 key; anonymous (reply-block) acks are bound
   to a secret per-transfer token sealed to the sender (a forger who lacks it is
   rejected). Authored `THREAT_MODEL.md` (assets, adversaries, mechanisms, and the
-  prioritized open gaps). *Still open:* wire a `/security-review` gate into CI
-  (devops-release) — the doc exists; the automated gate does not yet.
+  prioritized open gaps). *Automated security-review gate now in CI*
+  (devops-release): a `security` job runs `govulncheck` (dependency/stdlib CVEs),
+  `gosec` static analysis (crypto/permission/injection rules on; noise rules
+  excluded with rationale; single-site exceptions annotated `// #nosec`), and an
+  explicit run of the threat-model invariant tests (anonymity, identity/ack auth,
+  onion sealing, Sybil/eclipse). Any failure blocks the GitHub mirror push. Also
+  hardened key/data file permissions to owner-only (0700 dirs, 0600 private files)
+  while wiring it up.
 
 ---
 
@@ -219,8 +240,42 @@ These are **implementation** costs (fixable in-place), distinct from the
       `OnDataReceived`). Works over both the forwarded (onion) and direct paths and
       composes with sub-chunking. Wire: per-packet `Streaming`/`BlockIndex`/
       `BlockLen`/`Final` (length is unknown up front, so the last block is marked
-      rather than counted). *Not yet:* end-to-end confirm-delivery for streams, and
-      strict single-block receive bound (currently bounded by the reorder window).
+      rather than counted). *(End-to-end confirm-delivery for streams shipped later
+      — see "Streaming delivery confirmation" below.) Not yet:* a strict
+      single-block receive bound (receive is currently bounded by the reorder
+      window, not one block).
+
+## Round 12 — NAT/bridge security audit  ·  security-auditor  *(shipped)*
+Adversarial review of what a hostile swarm member can do to users behind NAT or
+attached via a bridge. Full write-up in `SECURITY_AUDIT.md`. Three findings, all
+fixed; identity binding, content confidentiality and replay defences held up.
+- **Onion anonymity collapsed for NAT'd destinations** (high). Satisfying the
+  reservation-relay constraint discarded the whole relay set, dragging hop count
+  and path count to one — so the reservation relay saw sender and destination
+  together. Enabling `NeedsRelay`, the flag a NAT'd user sets to *get* the relay
+  network, silently switched off the anonymity onion routing exists to provide.
+  The reservation relay is now pinned to the exit hop while earlier hops stay
+  diverse (which is what `exitNear` was always for).
+- **Gossip could forge a victim's reservation relays** (high). Peer-exchange
+  records are signed by the gossiper, not the subject, yet carried `RelayIDs` and
+  `Capabilities`. An attacker running one honest relay could name itself as any
+  NAT'd node's reservation relay and — via the finding above — become its entire
+  inbound path, learning every sender, timing and volume. `RelayIDs` is now a
+  signed field of `AnnouncePayload`, so it stays subject-attested through
+  forwarding; gossip is trusted only for a peer's statement about *itself*.
+- **Bridges were unauthenticated** (medium). Optional `BridgePSK` (relay:
+  `SYNCSWARM_BRIDGE_PSK` / `-bridge-psk-file`) gates who may attach, in both
+  directions, mutually, re-proven on reconnect. Default stays open for public
+  seeds. Never a command-line flag: `ps` would expose it to every local user.
+
+Closing the gossip hole broke NAT'd delivery in the field while the unit suite
+stayed green, which is the lesson worth keeping: announces flooded by broadcast
+only, so the "authenticated channel" reached nobody; self-attested gossip was
+rejected along with the forgeable kind; and `resolveDest` short-circuited the
+path request that fetches a peer's announce. Fixed, then re-verified live —
+1 KiB/32 KiB/256 KiB delivered and acknowledged over a 2-hop path between two
+NAT'd hosts with no forwarded ports. `swarmsync/natreach_test.go` now reproduces
+that topology in-process in ~3s.
 
 ## Round 11 — Product: the messenger  ·  messenger-app + media-specialist  *(in progress, separate repo)*
 - Its prerequisites (authenticated identity, reachability, reliability) have all
@@ -237,14 +292,16 @@ These are **implementation** costs (fixable in-place), distinct from the
 - Full design in **[RETICULUM_ALIGNMENT.md](RETICULUM_ALIGNMENT.md)**. Our identity
   core already matches Reticulum (Ed25519+X25519, 16-byte key-bound address, no source
   addr in forwarded packets); the gap is purely the transport/discovery/routing layer.
-- **Scope: v1 = IP-ish media (UDP/TCP/I2P/Bluetooth).** LoRa/serial are stubbed to
-  keep the seam open for a later bridge into **Reticulum RNode / Meshtastic / MeshCore**.
+- **Scope: v1 = IP-ish media (UDP/TCP/I2P/Bluetooth)** plus **LoRa/serial over
+  KISS** *(now implemented)* — a node can join the mesh over the air (Reticulum
+  RNode / Meshtastic / MeshCore in KISS mode) with no IP.
 - Phases (each additive, messenger stays green): **P0** Interface abstraction
   (`internal/iface`; wrap current UDP/TCP sockets) → **P1** Announce + path table
   (`PacketTypeAnnounce`, controlled flood) → **P2** Path requests (drop the DNS-seed
   dependency) → **P3** per-hop routing per `Profile` (onion preserved for Anonymous)
-  → **P4** `AutoInterface` zero-config LAN (IPv6 multicast) → **P5** MTU-driven sizing
-  + light up the radio interfaces.
+  → ~~**P4** `AutoInterface` zero-config LAN (IPv6 multicast)~~ *(shipped)* →
+  ~~**P5** MTU-driven sizing + light up the radio interfaces (LoRa/serial over KISS)~~
+  *(shipped)*.
 - **Landed:** `internal/iface` seam (Interface + UDP/TCP interfaces + LoRa/serial
   stubs, race-tested); **Phase 0a** — `Discovery` rewired onto `UDPInterface`,
   behavior-preserving; **Phase 1** — `PacketTypeAnnounce` + self-signed `AnnouncePayload`
@@ -258,6 +315,16 @@ These are **implementation** costs (fixable in-place), distinct from the
   TCP); **unicast-over-bridge** — `nodeIface` routing sends latency/gossip/findnode over
   the interface a peer was heard on (bridged peers fully first-class; fallback to UDP
   keeps non-bridge behavior). All unit-tested -race; messenger green.
+- **Phase 4 — zero-config LAN (`AutoInterface`) landed.** `iface.AutoInterface`
+  joins a fixed IPv6 **link-local multicast** group on every eligible interface, so
+  nodes on the same physical network discover each other with **no bootstrap host,
+  DNS seed, or broadcast-address config** — plug two machines into the same
+  switch/Wi-Fi and they find each other. Additive (composes with seeds/bridges/UDP
+  broadcast); `Options.AutoInterface` (SDK) and `relay -auto` opt in. A host with no
+  multicast-capable interface (loopback-only container) returns `ErrNoMulticast` and
+  is skipped, never fatal. `Discovery.AddAutoInterface`. Tested (`internal/iface`);
+  same-host multicast delivery is environment-dependent so the delivery test skips
+  where the OS doesn't loop it (real cross-host LAN is the target case).
 - **Link/session primitive landed** (`internal/link`): Reticulum Link — ephemeral
   encrypted session (X25519 ECDH + HKDF, forward secrecy, initiator anonymity, dest
   auth via signed proof, AES-GCM data), transport-agnostic, -race tested.
@@ -269,9 +336,46 @@ These are **implementation** costs (fixable in-place), distinct from the
   chunk arbitrary payloads; `Discovery.DialNode` dials a known node; receiver delivers
   via `OnDataReceived`. Forward-secret, no shared key/RS/onion. Additive (TCP/onion path
   untouched), E2E tested over real UDP under -race.
-- **Phase 0b remaining:** ride Links for the streaming/erasure-coded/onion transfer
-  paths (needs a reliability/Resource layer + per-hop routing) and link reuse; optional
-  frame-router split. Also unblocks per-hop routing (P3).
+- **Phase 0b remaining — now scoped in [PHASE_0B.md](PHASE_0B.md):** ride Links for the
+  streaming/erasure-coded/onion transfer paths (needs a reliability/Resource layer with
+  selective ARQ + per-hop routing) and link reuse; optional frame-router split. Broken
+  into additive sub-phases 0b.1–0b.4 (Resource layer → direct-over-Link → onion-over-Link
+  → link reuse) so the TCP path stays green until the flip. Also unblocks per-hop routing
+  (P3).
+- **RESOLVED (2026-09-06) — unicast to peers reached *through* a bridge.** Fixed by
+  `PacketTypeRoutedDiscovery`: unicast toward a non-adjacent peer is now routed by
+  destination over the P3 per-hop transport, carrying the original signed discovery
+  packet, with reverse-path learning recorded only after the inner signature is
+  verified. See `SECURITY_AUDIT.md` finding 12. Original description follows.
+- **Residual (historical) — unicast to peers reached *through* a bridge goes to the bridge peer.**
+  `ifaceFor(nodeID)` routes unicast (latency checks, gossip, FIND_NODE) over the
+  interface a peer was heard on. For a peer learned *via* a bridge that interface is
+  the `TCPClientInterface`, whose `Send` ignores the address argument and writes to
+  its single connection — so a latency check addressed to a distant node is
+  delivered to the **bridge peer**, which answers as itself. Nonce-only matching
+  used to accept that reply, so bridged peers merely *looked* verified; with
+  identity-bound liveness the wrong-signer reply is correctly rejected and such
+  peers now never verify at all. Observed live on a NAT'd LAN node: with `-bridge`
+  **no peer ever became active** (so it had no relay to reserve with); without it,
+  both relays verified within 15s. The bridge peer's own entry also showed an
+  **empty address**, which is not yet explained. Bridged peers are therefore only
+  first-class for the bridge peer itself, not for anything reached through it. The
+  fix is not a patch: unicast toward a non-adjacent peer must be *routed* (path
+  table / per-hop transport, which P3 now provides) rather than dialled on an
+  interface that cannot address it. Until then, `-bridge` is a discovery-flood
+  mechanism, not a general unicast transport.
+- **Residual — capability advertisement is global, not per-interface.** A node
+  advertises `relay` once, for the whole node, and AutoNAT answers a single
+  question: "can peers on the internet dial me back?" But reachability is really
+  *per-interface* — a LAN machine is perfectly dialable from its own LAN while
+  unreachable from the internet. So a node that could legitimately relay for its
+  LAN peers is demoted globally by the relay auto-demote, and conversely a node
+  reachable on one medium (a bridge, LoRa) but not another cannot express that.
+  This is the one place the design is coarser than the `internal/iface` model,
+  which is per-interface everywhere else. Fixing it means advertising capability
+  per interface (relay-capable on `udp0`, not on the bridge) and teaching path
+  selection to match hops to the interface that reaches them — a design pass, not
+  a patch. Noticed while wiring relay auto-demote.
 - Key invariant to keep honest: `ProfileAnonymous` MUST NOT build a shareable path
   table from onion traffic (asserted in tests). See THREAT_MODEL.
 

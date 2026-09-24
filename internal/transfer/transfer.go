@@ -7,8 +7,8 @@ import (
 	"crypto/ed25519"
 	"crypto/mlkem"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,6 +21,7 @@ import (
 	"github.com/APoniatowski/syncswarm/internal/discovery"
 	"github.com/APoniatowski/syncswarm/internal/encryption"
 	"github.com/APoniatowski/syncswarm/internal/fragment"
+	"github.com/APoniatowski/syncswarm/internal/link"
 	"github.com/APoniatowski/syncswarm/internal/monitoring"
 	"github.com/APoniatowski/syncswarm/internal/protocol"
 	"github.com/APoniatowski/syncswarm/internal/routing"
@@ -36,9 +37,36 @@ const (
 	// comfortably above a sealed sequential chunk (maxChunkSize + AEAD overhead)
 	// so ordinary chunks are never split.
 	maxSubChunkSize = 4 * 1024 * 1024 // 4MB wire cap per fragment
-	transferPort    = 64513           // Port for data transfer (one above discovery)
-	maxRetries      = 3
-	retryDelay      = time.Second * 2
+
+	// maxInboundConns bounds concurrent inbound data-plane connections. Anyone who
+	// can reach the port can open one, so this is the ceiling on how much an
+	// unauthenticated party can make the node allocate at once.
+	maxInboundConns = 256
+
+	// maxConcurrentRelayPeels bounds relay blobs being peeled and forwarded at
+	// once. Needed because the work is dispatched off the caller's goroutine (see
+	// HandleRelayBlobAsync) and must not become an unbounded goroutine spawner.
+	maxConcurrentRelayPeels = 64
+
+	// lateAckTTL is how long an unconfirmed transfer stays eligible for a late
+	// acknowledgement. Sized to outlast the store-and-forward hold, since that is
+	// the case it exists for: a recipient who was offline is redelivered when they
+	// return, and the ack follows.
+	lateAckTTL = 30 * time.Minute
+	// maxLateAcks bounds retained registrations. Retention is triggered by a peer
+	// *not* acking, so it must not be unbounded.
+	maxLateAcks  = 4096
+	transferPort = 64513 // Port for data transfer (one above discovery)
+	maxRetries   = 3
+	retryDelay   = time.Second * 2
+
+	// dataDialTimeout bounds a single TCP connect to a peer's data port. Without
+	// it a bare net.Dial waits out the OS connect timeout (~127s on Linux), so one
+	// unreachable peer stalled a send for maxRetries * that — minutes of silent
+	// blocking. A peer that has not completed a handshake in this long is
+	// unreachable for our purposes; failing fast lets the caller fall back to
+	// another path.
+	dataDialTimeout = 10 * time.Second
 
 	ackTimeout     = time.Second * 3 // wait for a delivery ack before resending
 	maxAckAttempts = 3               // resend attempts before giving up on confirmation
@@ -51,11 +79,22 @@ const DataPort = transferPort
 // Transfer handles the data transfer between nodes
 type Transfer struct {
 	discovery *discovery.Discovery
-	storage   *storage.Storage
-	selfID    string
-	sealer    encryption.Sealer  // non-nil when a developer key is configured
-	onData    func([]byte, bool) // delivery callback; bool = payload is a gob variable
-	nodePriv  *ecdh.PrivateKey   // this node's X25519 key, used to peel forwarded layers
+
+	// connSlots bounds concurrent inbound connections (see acceptConnections).
+	connSlots chan struct{}
+
+	// relaySlots bounds concurrent relay-blob peels dispatched off the receive
+	// path (see HandleRelayBlobAsync).
+	relaySlots chan struct{}
+
+	// onDelivered, when set, is called if an acknowledgement arrives after the
+	// sender already gave up (see retainForLateAck).
+	onDelivered atomic.Pointer[func(id [32]byte, destNode string)]
+	storage     *storage.Storage
+	selfID      string
+	sealer      encryption.Sealer  // non-nil when a developer key is configured
+	onData      func([]byte, bool) // delivery callback; bool = payload is a gob variable
+	nodePriv    *ecdh.PrivateKey   // this node's X25519 key, used to peel forwarded layers
 
 	// sealToRecipient enables per-recipient end-to-end sealing: a targeted send to
 	// a keyed node seals fragments to that node's public key instead of a shared
@@ -67,12 +106,31 @@ type Transfer struct {
 	postQuantum bool
 	mlkemDecap  *mlkem.DecapsulationKey768
 
-	signKey      ed25519.PrivateKey // this node's Ed25519 identity key, signs outgoing packets
-	hopCount     int                // intermediary hops per fragment (0 = direct)
-	redundancy   int                // independent paths sent per fragment (>=1)
-	dataShards   int                // Reed-Solomon data shards (0 = plain sequential chunks)
-	parityShards int                // Reed-Solomon parity shards
-	subChunkSize int                // wire cap per fragment; larger fragments are sub-chunked
+	signKey  ed25519.PrivateKey // this node's Ed25519 identity key, signs outgoing packets
+	hopCount int                // fixed intermediary hops per fragment (0 = direct)
+
+	// Adaptive onion routing: when adaptiveOnion is set, the onion path length is
+	// chosen per send from available relay diversity (routing.AdaptiveHops),
+	// bounded by [minOnionHops, maxOnionHops], instead of the fixed hopCount.
+	// Adaptive routing is fail-closed: a send that cannot meet the floor errors
+	// rather than degrading to a direct (sender-revealing) send.
+	adaptiveOnion bool
+	minOnionHops  int
+	maxOnionHops  int
+	seedHosts     map[string]bool // hosts of bootstrap seeds, deprioritized as relays
+
+	// Adaptive redundancy: when set, the number of independent paths per fragment
+	// is chosen from relay diversity (distinct-subnet relays), bounded by
+	// [minRedundancy, maxRedundancy], instead of the fixed redundancy — so
+	// resilience scales up as the network grows without over-sending on a small one.
+	adaptiveRedundancy bool
+	minRedundancy      int
+	maxRedundancy      int
+
+	redundancy   int // independent paths sent per fragment (>=1)
+	dataShards   int // Reed-Solomon data shards (0 = plain sequential chunks)
+	parityShards int // Reed-Solomon parity shards
+	subChunkSize int // wire cap per fragment; larger fragments are sub-chunked
 
 	// Streaming (block-wise RS): SendStream cuts the payload into blocks of
 	// streamBlockSize so neither end buffers it whole; streamSink, when set,
@@ -106,6 +164,19 @@ type Transfer struct {
 	// forwarded route fail rather than silently fall back to a direct send (which
 	// would reveal the sender's address to the recipient). Opt-in.
 	strictAnon bool
+
+	// onionOverLinks prefers carrying onion relay blobs over encrypted Links
+	// (frame-oriented, reaches bridged/LAN-multicast/radio hops and is
+	// initiator-anonymous per handshake) rather than a direct TCP dial. Phase 0b.3;
+	// off by default (TCP stays the default onion transport, with Links as fallback).
+	onionOverLinks bool
+
+	// perHopRouting sends a targeted transfer via per-hop transport routing
+	// (Reticulum-style: relays forward toward the destination using their announce
+	// path tables) instead of source-routed onion. For the non-anonymous profiles
+	// only — it is NEVER used when anonymity is required (strictAnon/adaptiveOnion),
+	// because per-hop routing exposes the destination to each relay. Phase 3.
+	perHopRouting bool
 
 	// Anonymity hardening (Round 8).
 	coverTraffic bool          // emit indistinguishable decoy traffic
@@ -188,6 +259,7 @@ type transferState struct {
 	scheme      scheme // fragmentation scheme (RS metadata + variable flag)
 	sourceNode  string // origin node ID (direct, non-anonymous acks)
 	replyBlock  []byte // anonymous onion return path for the delivery ack
+	routed      bool   // arrived via per-hop routing (ack, if any, routes back)
 
 	// stream is set for block-wise streaming transfers (scheme.Streaming); when
 	// non-nil, fragments are routed to it and reassembled/flushed per block
@@ -245,6 +317,8 @@ func NewTransfer(disc *discovery.Discovery, store *storage.Storage, selfID strin
 		dataShards:         dataShards,
 		parityShards:       parityShards,
 		subChunkSize:       maxSubChunkSize,
+		connSlots:          make(chan struct{}, maxInboundConns),
+		relaySlots:         make(chan struct{}, maxConcurrentRelayPeels),
 		streamBlockSize:    defaultStreamBlockSize,
 		confirm:            confirm,
 		dataPort:           listener.Addr().(*net.TCPAddr).Port,
@@ -335,6 +409,94 @@ func (t *Transfer) SetSealToRecipient(v bool) { t.sealToRecipient = v }
 // Call before Start.
 func (t *Transfer) SetStrictAnonymity(v bool) { t.strictAnon = v }
 
+// SetOnionOverLinks prefers carrying onion relay blobs over encrypted Links rather
+// than a direct TCP dial (Phase 0b.3), so onion traffic reaches bridged/radio hops
+// and each hop is initiator-anonymous. Call before Start.
+func (t *Transfer) SetOnionOverLinks(v bool) { t.onionOverLinks = v }
+
+// SetPerHopRouting enables per-hop transport routing for targeted sends (Phase 3),
+// used only by the non-anonymous profiles. Call before Start.
+func (t *Transfer) SetPerHopRouting(v bool) { t.perHopRouting = v }
+
+// usePerHop reports whether a targeted send should use per-hop transport routing.
+// It is gated OFF whenever anonymity is required, so ProfileAnonymous always keeps
+// onion source-routing (per-hop routing would reveal the destination to relays and
+// build a route a relay could link to a destination).
+func (t *Transfer) usePerHop() bool {
+	return t.perHopRouting && !t.strictAnon && !t.adaptiveOnion
+}
+
+// SetAdaptiveOnion enables per-send adaptive onion hop selection bounded by
+// [minHops, maxHops] (maxHops <= 0 means the built-in cap of 3). Call before Start.
+func (t *Transfer) SetAdaptiveOnion(on bool, minHops, maxHops int) {
+	t.adaptiveOnion = on
+	t.minOnionHops = minHops
+	t.maxOnionHops = maxHops
+}
+
+// defaultMaxRedundancy caps adaptive redundancy when no maximum is configured, so
+// a large swarm doesn't fan a fragment out over an unbounded number of paths.
+const defaultMaxRedundancy = 4
+
+// SetAdaptiveRedundancy enables per-send redundancy scaled from relay diversity,
+// bounded by [minPaths, maxPaths] (maxPaths <= 0 means defaultMaxRedundancy).
+// Call before Start.
+func (t *Transfer) SetAdaptiveRedundancy(on bool, minPaths, maxPaths int) {
+	t.adaptiveRedundancy = on
+	t.minRedundancy = minPaths
+	t.maxRedundancy = maxPaths
+}
+
+// pathsFor returns the number of independent paths to send each fragment over for
+// a send to destAddr given the eligible relays: adaptive from distinct-subnet
+// diversity, or the fixed redundancy. Always at least 1.
+func (t *Transfer) pathsFor(relays []routing.Peer, destAddr string) int {
+	if t.adaptiveRedundancy {
+		n := routing.DistinctSubnetRelays(destAddr, relays)
+		if t.minRedundancy > 0 && n < t.minRedundancy {
+			n = t.minRedundancy
+		}
+		max := t.maxRedundancy
+		if max <= 0 {
+			max = defaultMaxRedundancy
+		}
+		if n > max {
+			n = max
+		}
+		if n < 1 {
+			n = 1
+		}
+		return n
+	}
+	if t.redundancy < 1 {
+		return 1
+	}
+	return t.redundancy
+}
+
+// SetSeedHosts records host strings (IPs) that belong to bootstrap seeds, so
+// onion path selection keeps them out of the preferred relay pool (a seed should
+// serve first contact, not carry general traffic). Call before Start.
+func (t *Transfer) SetSeedHosts(hosts map[string]bool) { t.seedHosts = hosts }
+
+// wantForward reports whether targeted sends should be onion-routed (a fixed hop
+// count, or adaptive) rather than sent directly.
+func (t *Transfer) wantForward() bool { return t.hopCount > 0 || t.adaptiveOnion }
+
+// failClosed reports whether an anonymous send that cannot build a route must
+// error instead of falling back to a direct send. Adaptive routing is always
+// fail-closed; a fixed hop count is only when StrictAnonymity is set.
+func (t *Transfer) failClosed() bool { return t.strictAnon || t.adaptiveOnion }
+
+// hopsFor returns the onion hop count to use for a send to destAddr given the
+// eligible relays: adaptive from relay diversity, or the fixed hopCount.
+func (t *Transfer) hopsFor(relays []routing.Peer, destAddr string) int {
+	if t.adaptiveOnion {
+		return routing.AdaptiveHops(destAddr, relays, t.minOnionHops, t.maxOnionHops)
+	}
+	return t.hopCount
+}
+
 // SetPostQuantum enables hybrid X25519 + ML-KEM-768 sealing (with
 // sealToRecipient) and installs this node's ML-KEM decapsulation key for opening
 // PQ-sealed fragments. Call before Start.
@@ -422,6 +584,12 @@ func (t *Transfer) Start() {
 	if t.relayScoring {
 		go t.maintainReputation()
 	}
+	// Receive per-hop routed fragments addressed to us (Phase 3). Registered so this
+	// node can be a routed destination even when it does not itself send via per-hop
+	// routing. Guarded for socket-free unit tests that run with no discovery.
+	if t.discovery != nil {
+		t.discovery.SetRoutedHandler(func(inner []byte, _ string) { t.ingestRoutedFragment(inner) })
+	}
 }
 
 // Stop halts all transfer activities
@@ -446,8 +614,19 @@ func (t *Transfer) resolveDest(destNode string, nodes []*discovery.Node) []*disc
 			return nodes // already known
 		}
 	}
-	if _, found := t.discovery.FindNode(destNode); found {
+	// Locating the destination is not the same as being able to reach it. A NAT'd
+	// peer is never "active" — it cannot answer a direct probe — so a successful
+	// FindNode here still leaves it unroutable, and returning early would skip the
+	// path request that fetches its signed announce, which is the only place its
+	// reservation relays come from. Take the early exit only when the peer is
+	// genuinely usable.
+	if _, found := t.discovery.FindNode(destNode); found && t.discovery.CircuitReachable(destNode) {
 		return t.discovery.GetActiveNodes()
+	}
+	for _, n := range t.discovery.GetActiveNodes() {
+		if n.ID == destNode {
+			return t.discovery.GetActiveNodes()
+		}
 	}
 	// Fall back to a Reticulum-style path request: flood for a path and wait
 	// briefly for an announce to establish one, then re-read the node table. This
@@ -499,8 +678,24 @@ func (t *Transfer) recipientOpener(sc scheme) encryption.Sealer {
 // the payload as a gob-encoded value so the receiver routes it to
 // OnVariableReceived rather than OnDataReceived.
 func (t *Transfer) SendData(data []byte, destGroup, destNode string, variable bool) error {
-	// Generate unique ID for this transfer (raw SHA-256).
-	id := sha256.Sum256(append(data, []byte(time.Now().String())...))
+	_, err := t.SendDataTracked(data, destGroup, destNode, variable)
+	return err
+}
+
+// SendDataTracked is SendData but also returns the transfer ID, so a caller can
+// correlate a later OnDelivered callback with this send. The ID is returned even
+// when the error is non-nil, provided fragments were actually emitted — which is
+// exactly the ErrNotConfirmed case a late ack can still resolve.
+func (t *Transfer) SendDataTracked(data []byte, destGroup, destNode string, variable bool) (id [32]byte, err error) {
+	// A random transfer ID, not a hash of the payload. Deriving it from the
+	// plaintext made it a confirmation oracle: the ID travels with the transfer,
+	// so anyone who sees it and can guess the content could verify the guess by
+	// recomputing the hash — and the only other input, a wall-clock string, is
+	// cheap to search. Randomness also removes the (remote) chance that two sends
+	// of identical bytes in the same instant collide on one ID.
+	if _, err := rand.Read(id[:]); err != nil {
+		return id, fmt.Errorf("transfer: generating id: %w", err)
+	}
 
 	// Resolve the destination(s) first — needed both to route and to pick the
 	// content sealer. If a specific destination isn't currently known,
@@ -508,7 +703,7 @@ func (t *Transfer) SendData(data []byte, destGroup, destNode string, variable bo
 	nodes := t.discovery.GetActiveNodes()
 	nodes = t.resolveDest(destNode, nodes)
 	if len(nodes) == 0 {
-		return fmt.Errorf("no active nodes available for transfer")
+		return id, fmt.Errorf("no active nodes available for transfer")
 	}
 	byID := make(map[string]*discovery.Node, len(nodes))
 	for _, n := range nodes {
@@ -516,16 +711,29 @@ func (t *Transfer) SendData(data []byte, destGroup, destNode string, variable bo
 	}
 	if destNode != "" {
 		if _, ok := byID[destNode]; !ok {
-			return fmt.Errorf("destination node %s is not active", destNode)
+			// A peer behind NAT can never pass a direct liveness probe, so it is
+			// never "active" — but if it holds a circuit reservation with a relay we
+			// have verified, it is genuinely reachable: the final hop is pushed down
+			// that held connection instead of dialled. Admit it on that basis.
+			if n, known := t.discovery.NodeByID(destNode); known && t.discovery.CircuitReachable(destNode) {
+				byID[destNode] = n
+				nodes = append(nodes, n)
+			}
+		}
+		if _, ok := byID[destNode]; !ok {
+			return id, fmt.Errorf("destination node %s is not reachable (not active, and no live circuit reservation): %w", destNode, ErrDestinationUnreachable)
 		}
 	}
 
-	// Strict anonymity: if hops are requested for a targeted send but no forwarded
-	// route can be built, fail here rather than silently degrading to a direct send
-	// that would reveal the sender to the recipient. Checked before any side effects.
-	if t.strictAnon && destNode != "" && t.hopCount > 0 && t.nodePriv != nil {
-		if dest, ok := byID[destNode]; !ok || len(dest.PubKey) == 0 || len(t.relayPeers(nodes, destNode)) == 0 {
-			return fmt.Errorf("strict anonymity: no relay route to %s for %d hops", destNode, t.hopCount)
+	// Fail-closed anonymity (StrictAnonymity or adaptive onion routing): if an
+	// anonymous send cannot build a route with the required diversity, fail here
+	// rather than silently degrading to a direct send that would reveal the
+	// sender. Checked before any side effects.
+	if t.failClosed() && destNode != "" && t.wantForward() && t.nodePriv != nil {
+		dest, ok := byID[destNode]
+		relays := t.relayPeers(nodes, destNode)
+		if !ok || len(dest.PubKey) == 0 || len(relays) == 0 || t.hopsFor(relays, peerDialAddr(dest)) <= 0 {
+			return id, fmt.Errorf("anonymity required but no relay route to %s (insufficient relays/diversity): %w", destNode, ErrNoAnonymousRoute)
 		}
 	}
 
@@ -537,7 +745,7 @@ func (t *Transfer) SendData(data []byte, destGroup, destNode string, variable bo
 	// Build the wire fragments and the scheme the receiver needs to reassemble.
 	frags, sc, err := t.buildFragments(id, data, variable, sealer)
 	if err != nil {
-		return fmt.Errorf("failed to build fragments: %w", err)
+		return id, fmt.Errorf("failed to build fragments: %w", err)
 	}
 	sc.HybridSealed = hybrid
 	sc.PQ = pq
@@ -556,7 +764,7 @@ func (t *Transfer) SendData(data []byte, destGroup, destNode string, variable bo
 	localChunks := fragment.Split(data, maxChunkSize)
 	for i, chunk := range localChunks {
 		if err := t.storage.SaveChunk(id, uint32(i+1), chunk, meta); err != nil {
-			return fmt.Errorf("failed to store chunk %d: %w", i+1, err)
+			return id, fmt.Errorf("failed to store chunk %d: %w", i+1, err)
 		}
 	}
 
@@ -564,7 +772,7 @@ func (t *Transfer) SendData(data []byte, destGroup, destNode string, variable bo
 	// planner works on decoupled routing.Peer values adapted from discovery.
 	ordered, err := (&routing.Planner{}).FastestRoute(destNode, nodesToPeers(nodes))
 	if err != nil {
-		return fmt.Errorf("failed to plan route: %w", err)
+		return id, fmt.Errorf("failed to plan route: %w", err)
 	}
 
 	// ackToken authenticates the anonymous reply-block ack for this transfer; it
@@ -577,15 +785,29 @@ func (t *Transfer) SendData(data []byte, destGroup, destNode string, variable bo
 	// per-hop layers so no node on the path sees the whole payload or both ends),
 	// otherwise a direct send. Broadcast fans out to all active nodes.
 	sendOnce := func() {
-		if destNode != "" && t.hopCount > 0 && t.nodePriv != nil {
+		// Per-hop transport routing (non-anonymous profiles): forward the sealed
+		// fragments toward the destination via transport nodes' path tables rather
+		// than source-routed onion. Gated off under anonymity. Falls back to onion/
+		// direct if no path is known yet.
+		if destNode != "" && t.usePerHop() {
+			ackOrigin := "" // only reveal the origin (for the ack) when confirming
+			if t.confirm {
+				ackOrigin = t.selfID
+			}
+			if err := t.sendRouted(destNode, ackOrigin, id, frags, sc); err == nil {
+				return
+			}
+		}
+		if destNode != "" && t.wantForward() && t.nodePriv != nil {
 			if dest, ok := byID[destNode]; ok && len(dest.PubKey) > 0 {
 				if err := t.sendForwarded(dest, nodes, id, frags, sc, ackToken); err == nil {
 					return
 				}
-				// Forwarded delivery failed. In strict-anonymity mode do not fall
-				// back to a direct send (which would reveal the sender); leave it
-				// unsent so a confirmed send retries the anonymous path or errors.
-				if t.strictAnon {
+				// Forwarded delivery failed. When fail-closed (strict or adaptive)
+				// do not fall back to a direct send (which would reveal the sender);
+				// leave it unsent so a confirmed send retries the anonymous path or
+				// errors.
+				if t.failClosed() {
 					return
 				}
 			}
@@ -619,22 +841,35 @@ func (t *Transfer) SendData(data []byte, destGroup, destNode string, variable bo
 	if destNode != "" && t.confirm {
 		ackToken = randomToken()
 		ackCh := t.registerAck(id, byID[destNode].SignKey, ackToken)
-		defer t.unregisterAck(id)
+		// Deliberately not unregistered on the give-up path: see retainForLateAck.
+		defer func() {
+			t.ackMu.Lock()
+			pa, ok := t.pendingAcks[id]
+			retain := ok && pa.late
+			t.ackMu.Unlock()
+			if !retain {
+				t.unregisterAck(id)
+			}
+		}()
 		for attempt := 0; attempt < maxAckAttempts; attempt++ {
 			sendOnce()
 			select {
 			case <-ackCh:
-				return nil
+				return id, nil
 			case <-time.After(ackTimeout):
 			case <-t.ctx.Done():
-				return fmt.Errorf("transfer canceled")
+				return id, fmt.Errorf("transfer canceled")
 			}
 		}
-		return fmt.Errorf("delivery to %s not confirmed after %d attempts", destNode, maxAckAttempts)
+		// Keep listening: the fragments may be held by a store-and-forward relay and
+		// acked once the recipient comes back. The caller hears about it through
+		// OnDeliveryConfirmed rather than from this return value.
+		t.retainForLateAck(id, destNode)
+		return id, fmt.Errorf("delivery to %s not confirmed after %d attempts: %w", destNode, maxAckAttempts, ErrNotConfirmed)
 	}
 
 	sendOnce()
-	return nil
+	return id, nil
 }
 
 // acceptConnections handles incoming transfer connections
@@ -648,7 +883,22 @@ func (t *Transfer) acceptConnections() {
 			if err != nil {
 				continue
 			}
-			go t.handleConnection(conn)
+			// Bound concurrency as well as time. Each in-flight connection costs a
+			// goroutine and, on its first frame, a buffer sized by the length the
+			// peer declares — so an unbounded accept loop lets anyone who can reach
+			// the data port multiply cheap connections into arbitrary memory. Shed
+			// load instead: refuse the connection rather than queue it, so the cost
+			// of being over the limit is a closed socket, not an OOM.
+			select {
+			case t.connSlots <- struct{}{}:
+			default:
+				conn.Close()
+				continue
+			}
+			go func(c net.Conn) {
+				defer func() { <-t.connSlots }()
+				t.handleConnection(withIOTimeout(c))
+			}(conn)
 		}
 	}
 }
@@ -750,6 +1000,10 @@ func (t *Transfer) handleConnection(conn net.Conn) {
 	transferID := state.ID
 	defer func() {
 		if sc.Resumable && sc.Streaming && !t.isTransferComplete(state) {
+			// Retained for a later resume, so it outlives this connection — which
+			// means the connection limit does not bound it. Cap the population here,
+			// at the moment it grows.
+			t.enforceRetainedStreamCap()
 			return
 		}
 		t.transfers.Delete(transferID)
@@ -762,6 +1016,11 @@ func (t *Transfer) handleConnection(conn net.Conn) {
 	if sc.Resumable && state.stream != nil {
 		ack.ChunkNumber = state.stream.resumeFrom()
 	}
+	// Pad the ack to the same cell boundary as a data fragment. An ack is much
+	// smaller than a fragment, so leaving it unpadded made it the one packet an
+	// observer could classify by size alone — a reliable "this node just received
+	// something" marker, and a starting point for correlation.
+	t.padPacket(ack)
 	ack.Sign(t.signKey)
 	if err := protocol.WritePacket(conn, ack); err != nil {
 		return
@@ -780,6 +1039,11 @@ func (t *Transfer) handleConnection(conn net.Conn) {
 		// Send chunk acknowledgment
 		ack := protocol.NewPacket(protocol.PacketTypeAcknowledgement, nil, "", packet.SourceNode)
 		ack.SourceNode = t.selfID
+		// Pad the ack to the same cell boundary as a data fragment. An ack is much
+		// smaller than a fragment, so leaving it unpadded made it the one packet an
+		// observer could classify by size alone — a reliable "this node just received
+		// something" marker, and a starting point for correlation.
+		t.padPacket(ack)
 		ack.Sign(t.signKey)
 		if err := protocol.WritePacket(conn, ack); err != nil {
 			return
@@ -841,14 +1105,10 @@ func (t *Transfer) dispatch(state *transferState, data []byte) {
 	if t.onData != nil {
 		go t.onData(data, state.scheme.Variable)
 	}
-	// Prefer the anonymous reply block (forwarded transfers); fall back to the
-	// source-addressed ack for direct, non-anonymous transfers.
-	switch {
-	case len(state.replyBlock) > 0:
-		go t.sendAckReply(state.replyBlock)
-	case state.sourceNode != "":
-		go t.sendAck(state.sourceNode, state.ID)
-	}
+	// Ack over the same transport the transfer arrived on: an anonymous reply block
+	// (onion), a routed ack back through the path table (per-hop routing), or a
+	// source-addressed direct ack.
+	go t.ackWithRedundancy(state)
 }
 
 // applyScheme stamps the fragmentation scheme (RS metadata + variable flag) onto
@@ -873,9 +1133,10 @@ func (t *Transfer) sendToNode(node *discovery.Node, id [32]byte, frags []fragmen
 	var conn net.Conn
 	var err error
 
-	// Try to connect with retries
+	// Try to connect with retries, each attempt bounded so an unreachable peer
+	// fails fast instead of hanging on the OS connect timeout.
 	for i := 0; i < maxRetries; i++ {
-		conn, err = net.Dial("tcp", addr)
+		conn, err = net.DialTimeout("tcp", addr, dataDialTimeout)
 		if err == nil {
 			break
 		}
@@ -885,6 +1146,7 @@ func (t *Transfer) sendToNode(node *discovery.Node, id [32]byte, frags []fragmen
 	if err != nil {
 		return fmt.Errorf("failed to connect to node %s: %w", node.ID, err)
 	}
+	conn = withIOTimeout(conn)
 	defer conn.Close()
 
 	r := bufio.NewReader(conn)
@@ -1182,15 +1444,18 @@ func (t *Transfer) sendForwarded(dest *discovery.Node, nodes []*discovery.Node, 
 // fragments can be emitted one at a time (used by both the whole-payload path
 // and the streaming path, which builds fragments block by block).
 type forwardCtx struct {
-	t          *Transfer
-	id         [32]byte
-	sc         scheme
-	destID     string
-	destPeer   routing.Peer
-	relays     []routing.Peer
-	planner    *routing.Planner
-	replyBlock []byte
-	paths      int
+	t            *Transfer
+	id           [32]byte
+	sc           scheme
+	destID       string
+	destPeer     routing.Peer
+	relays       []routing.Peer
+	planner      *routing.Planner
+	replyBlock   []byte
+	paths        int
+	hops         int             // onion path length for this transfer (fixed or adaptive)
+	deprioritize map[string]bool // seed hosts to keep out of the preferred relay pool
+	exitNear     map[string]bool // relay IDs near the destination (its advertised RelayIDs)
 }
 
 // newForwardCtx builds the reusable forwarding context: eligible relays, the
@@ -1205,35 +1470,60 @@ func (t *Transfer) newForwardCtx(dest *discovery.Node, nodes []*discovery.Node, 
 	// not excommunicated. Address is the node's dial-able data address.
 	relays := t.relayPeers(nodes, dest.ID)
 
-	// If the destination is reachable only through a circuit relay it reserved
-	// with, force the path to end at that relay so the final hop is delivered
-	// over the reservation rather than dialed.
-	if len(dest.RelayIDs) > 0 {
-		if rr := pickReservationRelay(relays, dest.RelayIDs); rr != nil {
-			relays = []routing.Peer{*rr}
-		}
+	// A NAT'd destination can only be entered through a relay it holds a
+	// reservation with, so that relay has to be the *exit* hop — but it must not
+	// become the *only* hop. Collapsing the relay set to it (which this used to do)
+	// dragged hop count and path count down with it, handing that single relay both
+	// the sender's address and the destination: turning on NeedsRelay silently
+	// traded away the anonymity onion routing exists to provide, for exactly the
+	// users who need it most. Keep the full set for diversity and let exitNear
+	// (below) pin the reservation relay to the last hop instead.
+	if len(dest.RelayIDs) > 0 && pickReservationRelay(relays, dest.RelayIDs) == nil {
+		return nil, fmt.Errorf("destination %s advertises reservation relays, none of which are usable", dest.ID)
 	}
 
-	// Number of independent paths per fragment. Capped at the number of distinct
-	// intermediaries so extra copies don't just repeat the same first hop.
-	paths := t.redundancy
-	if paths < 1 {
-		paths = 1
+	// Onion path length: fixed hopCount, or adaptive from relay diversity. Zero
+	// means we cannot route with the required anonymity (too few distinct-subnet
+	// relays, or below the adaptive floor) — fail rather than route unsafely.
+	destAddr := peerDialAddr(dest)
+	hops := t.hopsFor(relays, destAddr)
+	if hops <= 0 {
+		return nil, fmt.Errorf("forwarding unavailable: insufficient relay diversity for anonymous routing")
 	}
+
+	// Number of independent paths per fragment: fixed redundancy, or adaptive from
+	// relay diversity (more distinct-subnet relays -> more independent copies).
+	// Capped at the number of distinct intermediaries so extra copies don't just
+	// repeat the same first hop.
+	paths := t.pathsFor(relays, destAddr)
 	if len(relays) > 0 && paths > len(relays) {
 		paths = len(relays)
 	}
 
+	// Bias the exit hop toward the destination using the relays it advertises being
+	// reachable through (RelayIDs are relays near it), so a fragment doesn't take an
+	// absurd detour away from where it's headed.
+	var exitNear map[string]bool
+	if len(dest.RelayIDs) > 0 {
+		exitNear = make(map[string]bool, len(dest.RelayIDs))
+		for _, rid := range dest.RelayIDs {
+			exitNear[rid] = true
+		}
+	}
+
 	return &forwardCtx{
-		t:          t,
-		id:         id,
-		sc:         sc,
-		destID:     dest.ID,
-		destPeer:   routing.Peer{ID: dest.ID, Address: peerDialAddr(dest), PubKey: dest.PubKey, Active: true},
-		relays:     relays,
-		planner:    &routing.Planner{},
-		replyBlock: t.buildReplyBlock(id, relays, ackToken),
-		paths:      paths,
+		t:            t,
+		id:           id,
+		sc:           sc,
+		destID:       dest.ID,
+		destPeer:     routing.Peer{ID: dest.ID, Address: destAddr, PubKey: dest.PubKey, Active: true},
+		relays:       relays,
+		planner:      &routing.Planner{},
+		replyBlock:   t.buildReplyBlock(id, relays, ackToken),
+		paths:        paths,
+		hops:         hops,
+		deprioritize: t.seedHosts,
+		exitNear:     exitNear,
 	}, nil
 }
 
@@ -1243,7 +1533,7 @@ func (t *Transfer) newForwardCtx(dest *discovery.Node, nodes []*discovery.Node, 
 func (fc *forwardCtx) sendFragment(frag fragment.Fragment) error {
 	t := fc.t
 	for _, piece := range fragmentPieces(frag, t.subChunkSize) {
-		inner, err := t.buildInnerFragment(fc.id, fc.destID, piece, fc.sc, fc.replyBlock)
+		inner, err := t.buildInnerFragment(fc.id, fc.destID, "", piece, fc.sc, fc.replyBlock)
 		if err != nil {
 			return err
 		}
@@ -1254,8 +1544,23 @@ func (fc *forwardCtx) sendFragment(frag fragment.Fragment) error {
 		// arriving copy suffices.
 		sent := false
 		for copyIdx := 0; copyIdx < fc.paths; copyIdx++ {
-			seed := int(piece.BlockIndex) + int(piece.Index) + int(piece.SubIndex) + copyIdx
-			hops, err := fc.planner.BuildPath(fc.destPeer, rotatePeers(fc.relays, seed), t.hopCount)
+			// Mix the transfer's random ID into the shuffle seed. On its own the
+			// coordinate sum is a handful of small integers with no secret in it,
+			// so every node in the network derived the *same* relay ordering for a
+			// given fragment — spreading load far less than intended, and letting
+			// anyone who knows the relay set predict which relay would carry a
+			// given fragment and position themselves accordingly. Summing also
+			// collided heavily (block+index+sub is the same for many distinct
+			// pieces); folding in the ID and separating the coordinates fixes both.
+			seed := int64(binary.LittleEndian.Uint64(fc.id[:8]))
+			seed ^= int64(piece.BlockIndex)<<40 | int64(piece.Index)<<16 | int64(piece.SubIndex)<<4 | int64(copyIdx)
+			// Tiered selection spreads load across the fast pool and varies the path
+			// per copy (via Seed), so rotatePeers is no longer needed for diversity.
+			hops, err := fc.planner.BuildPathTiered(fc.destPeer, fc.relays, fc.hops, routing.PathOptions{
+				Seed:         seed,
+				Deprioritize: fc.deprioritize,
+				ExitNear:     fc.exitNear,
+			})
 			if err != nil {
 				return err
 			}
@@ -1267,7 +1572,7 @@ func (fc *forwardCtx) sendFragment(frag fragment.Fragment) error {
 			if err != nil {
 				return err
 			}
-			if err := t.sendRelayBlob(hops[0].Address, blob); err == nil {
+			if err := t.sendRelayHop(hops[0].NodeID, hops[0].Address, blob); err == nil {
 				sent = true
 			}
 		}
@@ -1278,6 +1583,120 @@ func (fc *forwardCtx) sendFragment(frag fragment.Fragment) error {
 		t.recordHop(HopSend, "forwarded")
 	}
 	return nil
+}
+
+// sendRouted delivers the sealed fragments to destID via per-hop transport
+// routing: each fragment (sub-chunked) is wrapped as an inner data packet — the
+// same bytes the onion path's final layer would reveal — and handed to
+// discovery.SendRouted, which forwards it toward the destination hop by hop. The
+// destination ingests it through the same path as an onion-delivered fragment.
+// Returns an error if no path to the destination is known (so the caller can fall
+// back to onion/direct). ackOrigin is this node's ID when delivery confirmation is
+// wanted (so the destination can route an ack back) and "" otherwise; per-hop
+// routing is non-anonymous, so exposing the origin for the ack is fine.
+func (t *Transfer) sendRouted(destID, ackOrigin string, id [32]byte, frags []fragment.Fragment, sc scheme) error {
+	sub := t.routedSubChunkSize(destID)
+	for _, frag := range frags {
+		for _, piece := range fragmentPieces(frag, sub) {
+			inner, err := t.buildInnerFragment(id, destID, ackOrigin, piece, sc, nil)
+			if err != nil {
+				return err
+			}
+			if !t.discovery.SendRouted(destID, inner, 0) {
+				return fmt.Errorf("no path to %s for per-hop routing", destID)
+			}
+			t.metrics.IncSent()
+			t.recordHop(HopSend, "routed")
+		}
+	}
+	return nil
+}
+
+// Reserves for routed sub-chunk sizing: the inner data packet's own header (a
+// second Packet layer inside the routed frame), and a floor so a tiny MTU still
+// makes progress rather than sizing to zero.
+const (
+	innerFragmentReserve = 256
+	minRoutedSubChunk    = 64
+)
+
+// routedSubChunkSize caps the per-fragment sub-chunk so a routed frame toward
+// destID fits that path's (first-hop) MTU — the data-plane analogue of the Link
+// layer's MTU-driven chunking. Falls back to the configured SubChunkSize when the
+// MTU is unknown (or large).
+func (t *Transfer) routedSubChunkSize(destID string) int {
+	return routedSubChunkFor(t.discovery.MTUToward(destID), t.subChunkSize, t.padCell)
+}
+
+// routedSubChunkFor is the pure sizing calculation: budget = mtu minus the routed
+// frame overhead, the inner packet header, and any padding cell, clamped to
+// [minRoutedSubChunk, subChunkSize].
+func routedSubChunkFor(mtu, subChunkSize, padCell int) int {
+	if mtu <= 0 {
+		return subChunkSize
+	}
+	budget := mtu - protocol.RoutedFrameOverhead - innerFragmentReserve - padCell
+	if budget < minRoutedSubChunk {
+		budget = minRoutedSubChunk
+	}
+	if budget < subChunkSize {
+		return budget
+	}
+	return subChunkSize
+}
+
+// ingestRoutedFragment handles an inner packet that arrived over per-hop transport
+// routing: a delivery ack is verified and signalled; a data fragment is reassembled
+// via the shared onion final-delivery path (marked routed so its own ack, if any,
+// is routed back).
+func (t *Transfer) ingestRoutedFragment(inner []byte) {
+	var pkt protocol.Packet
+	if err := pkt.UnmarshalBinary(inner); err != nil {
+		return
+	}
+	if pkt.Type == protocol.PacketTypeAcknowledgement {
+		// A routed delivery ack: authenticate it (signed by the destination we sent
+		// to) before letting it stop our resends.
+		if pkt.Verify() {
+			t.signalAckFrom(pkt.ID, pkt.SignerKey)
+		}
+		return
+	}
+	if pkt.Decoy {
+		t.metrics.IncDecoy()
+		return
+	}
+	t.ingestForwardedFragment(&pkt, true)
+}
+
+// sendRoutedAck routes a signed delivery ack for id back to the origin node via
+// per-hop transport routing (the origin may be reachable only through the path
+// table, so a direct dial would not reach it).
+func (t *Transfer) sendRoutedAck(originID string, id [32]byte) {
+	if originID == "" || originID == t.selfID {
+		return
+	}
+	ack := protocol.NewPacket(protocol.PacketTypeAcknowledgement, nil, "", originID)
+	ack.ID = id
+	ack.SourceNode = t.selfID
+	// Pad the ack to the same cell boundary as a data fragment. An ack is much
+	// smaller than a fragment, so leaving it unpadded made it the one packet an
+	// observer could classify by size alone — a reliable "this node just received
+	// something" marker, and a starting point for correlation.
+	t.padPacket(ack)
+	ack.Sign(t.signKey)
+	inner, err := ack.MarshalBinary()
+	if err != nil {
+		return
+	}
+	// Delay the ack like any other relayed packet. Padding hides its size, but an
+	// ack emitted the instant a fragment lands still pairs the two by timing: an
+	// observer watching this node sees a packet in and a packet out microseconds
+	// apart. The sender is waiting on a timeout anyway, so the delay costs nothing
+	// a user perceives. The reply-block path already gets this via sendRelayBlob;
+	// this is the routed path, which is the one a NAT'd origin uses.
+	t.applyJitter()
+	t.discovery.SendRouted(originID, inner, 0)
 }
 
 // rotatePeers returns peers rotated left by n (mod len), leaving the input
@@ -1308,15 +1727,17 @@ func toOnionHops(hops []routing.Hop) ([]encryption.OnionHop, error) {
 }
 
 // buildInnerFragment builds the marshaled data packet the final recipient
-// receives after peeling the last onion layer. It is deliberately anonymous: no
-// SourceNode and no identity signature, so the destination cannot learn who sent
-// it. Authenticity of the bytes comes from the onion's final-layer AEAD, and of
-// the content from the developer-key AEAD on the fragment payload. A single-use
-// reply block lets the destination acknowledge delivery without learning the
-// sender.
-func (t *Transfer) buildInnerFragment(id [32]byte, destID string, frag fragment.Fragment, sc scheme, replyBlock []byte) ([]byte, error) {
+// receives after peeling the last onion layer. For onion routing it is
+// deliberately anonymous (sourceNode ""): no SourceNode and no identity signature,
+// so the destination cannot learn who sent it — authenticity of the bytes comes
+// from the onion's final-layer AEAD, of the content from the developer-key AEAD,
+// and a single-use reply block lets the destination ack without learning the
+// sender. For per-hop routing (non-anonymous) the caller passes its own node ID as
+// sourceNode so the destination can route a delivery ack back to it.
+func (t *Transfer) buildInnerFragment(id [32]byte, destID, sourceNode string, frag fragment.Fragment, sc scheme, replyBlock []byte) ([]byte, error) {
 	pkt := protocol.NewPacket(protocol.PacketTypeData, frag.Payload, "", destID)
 	pkt.ID = id
+	pkt.SourceNode = sourceNode
 	pkt.ChunkNumber = frag.Index
 	pkt.TotalChunks = frag.Total
 	pkt.SubIndex = frag.SubIndex
@@ -1338,15 +1759,68 @@ func (t *Transfer) sendRelayBlob(addr string, blob []byte) error {
 	return t.sendPooled(addr, pkt)
 }
 
-// handleRelay peels one layer of a forwarded packet with this node's private key
-// and either delivers it (final recipient) or forwards it to the next hop.
+// linkRelayDialTimeout bounds the Link handshake for an onion hop.
+const linkRelayDialTimeout = 5 * time.Second
+
+// sendRelayHop delivers an onion blob to one hop. With onionOverLinks it prefers an
+// encrypted Link (reaches bridged/radio hops, initiator-anonymous), falling back to
+// a direct TCP dial; otherwise it dials TCP first and uses a Link only as a backup.
+// nodeID identifies the hop for Link dialing; addr is its dialable data address.
+func (t *Transfer) sendRelayHop(nodeID, addr string, blob []byte) error {
+	tcp := func() bool { return t.sendRelayBlob(addr, blob) == nil }
+	viaLink := func() bool { return t.sendRelayViaLink(nodeID, blob) }
+	if t.onionOverLinks {
+		if viaLink() || tcp() {
+			return nil
+		}
+	} else if tcp() || viaLink() {
+		return nil
+	}
+	return fmt.Errorf("relay hop to %s (%s) failed over both link and TCP", nodeID, addr)
+}
+
+// sendRelayViaLink carries an onion blob to nodeID over a (cached, forward-secret)
+// Link's relay sub-protocol. Returns false if links are unavailable, the node is
+// unknown, or the send fails.
+func (t *Transfer) sendRelayViaLink(nodeID string, blob []byte) bool {
+	if nodeID == "" {
+		return false
+	}
+	l, err := t.discovery.DialNode(nodeID, linkRelayDialTimeout)
+	if err != nil {
+		return false
+	}
+	t.applyJitter() // same timing-analysis defense the TCP hop applies
+	if err := link.NewRouter(l).SendRelay(blob); err != nil {
+		l.Close() // drop a stale cached link so the next hop re-dials
+		return false
+	}
+	return true
+}
+
+// handleRelay peels one layer of a forwarded packet received over the TCP data
+// path. The onion blob is the packet payload.
 func (t *Transfer) handleRelay(pkt *protocol.Packet) {
+	t.handleRelayBlob(pkt.Payload)
+}
+
+// HandleRelayBlob peels and forwards an onion relay blob received over a Link (the
+// Phase 0b.3 transport). It is the Link-path analogue of handleRelay; the blob is
+// the raw onion bytes (no transport packet wrapper), self-authenticated by the
+// onion's per-layer AEAD, so no packet signature is involved — which also keeps the
+// previous hop anonymous.
+func (t *Transfer) HandleRelayBlob(blob []byte) { t.handleRelayBlob(blob) }
+
+// handleRelayBlob peels one onion layer with this node's private key and either
+// delivers the inner packet (final recipient) or forwards the remaining blob to the
+// next hop.
+func (t *Transfer) handleRelayBlob(blob []byte) {
 	if t.nodePriv == nil {
 		return
 	}
 	t.metrics.IncReceived()
 	t.recordHop(HopReceive, "")
-	peel, err := encryption.PeelOnion(t.nodePriv, pkt.Payload)
+	peel, err := encryption.PeelOnion(t.nodePriv, blob)
 	if err != nil {
 		t.metrics.IncDropped()
 		t.recordHop(HopDrop, "unpeelable")
@@ -1383,7 +1857,7 @@ func (t *Transfer) handleRelay(pkt *protocol.Packet) {
 			t.signalAckToken(inner.ID, inner.Payload)
 			return
 		}
-		t.ingestForwardedFragment(&inner)
+		t.ingestForwardedFragment(&inner, false)
 		return
 	}
 
@@ -1397,7 +1871,7 @@ func (t *Transfer) handleRelay(pkt *protocol.Packet) {
 // delivers the payload once all fragments for the transfer are present. Fragments
 // for one transfer may arrive concurrently over separate connections, so state is
 // guarded by its mutex.
-func (t *Transfer) ingestForwardedFragment(pkt *protocol.Packet) {
+func (t *Transfer) ingestForwardedFragment(pkt *protocol.Packet, routed bool) {
 	v, _ := t.transfers.LoadOrStore(pkt.ID, &transferState{
 		ID:          pkt.ID,
 		Total:       pkt.TotalChunks,
@@ -1407,6 +1881,7 @@ func (t *Transfer) ingestForwardedFragment(pkt *protocol.Packet) {
 		scheme:      schemeFromPacket(pkt),
 		sourceNode:  pkt.SourceNode,
 		replyBlock:  pkt.ReplyBlock,
+		routed:      routed,
 		StartTime:   time.Now(),
 	})
 	state := v.(*transferState)
@@ -1530,6 +2005,16 @@ type pendingAck struct {
 	ch      chan struct{}
 	destKey []byte // expected destination Ed25519 key (direct acks)
 	token   []byte // secret echoed by the anonymous reply-block ack
+
+	// dest and expires support late acks. A recipient who was offline is
+	// redelivered by a store-and-forward relay when it returns, reassembles, and
+	// acks over the reply block — but by then SendTo has long given up. Dropping
+	// the registration at that point discarded the one message that says the
+	// transfer actually succeeded, leaving the sender permanently wrong. The
+	// registration is therefore retained, still authenticated, until expires.
+	dest    string
+	expires time.Time
+	late    bool // give-up already reported to the caller; a resolution is now "late"
 }
 
 // registerAck registers a pending confirmed transfer keyed by id.
@@ -1548,6 +2033,50 @@ func (t *Transfer) unregisterAck(id [32]byte) {
 	t.ackMu.Unlock()
 }
 
+// retainForLateAck keeps an unconfirmed transfer's registration alive after the
+// sender has given up, so an acknowledgement that arrives later — typically once a
+// store-and-forward relay redelivers to a recipient who was offline — can still be
+// authenticated and surfaced through OnDeliveryConfirmed.
+//
+// Bounded in both directions: entries expire after lateAckTTL and the map is capped
+// at maxLateAcks, because the ids are ours but the *arrival* is attacker-influenced
+// (anyone can decline to ack, forcing retention).
+func (t *Transfer) retainForLateAck(id [32]byte, dest string) {
+	t.ackMu.Lock()
+	defer t.ackMu.Unlock()
+	pa, ok := t.pendingAcks[id]
+	if !ok {
+		return
+	}
+	pa.dest = dest
+	pa.expires = time.Now().Add(lateAckTTL)
+	pa.late = true
+
+	now := time.Now()
+	for k, v := range t.pendingAcks {
+		if v.late && now.After(v.expires) {
+			delete(t.pendingAcks, k)
+		}
+	}
+	for len(t.pendingAcks) > maxLateAcks {
+		var oldestKey [32]byte
+		var oldest time.Time
+		found := false
+		for k, v := range t.pendingAcks {
+			if !v.late {
+				continue // never evict a send still waiting
+			}
+			if !found || v.expires.Before(oldest) {
+				oldestKey, oldest, found = k, v.expires, true
+			}
+		}
+		if !found {
+			break
+		}
+		delete(t.pendingAcks, oldestKey)
+	}
+}
+
 // resolveAck closes the pending channel for id iff accept(pending) is true,
 // authenticating the ack before it can stop the sender's resends.
 func (t *Transfer) resolveAck(id [32]byte, accept func(*pendingAck) bool) {
@@ -1559,10 +2088,19 @@ func (t *Transfer) resolveAck(id [32]byte, accept func(*pendingAck) bool) {
 		ok = false
 	}
 	t.ackMu.Unlock()
-	if ok {
-		t.metrics.IncAck()
-		close(pa.ch)
+	if !ok {
+		return
 	}
+	t.metrics.IncAck()
+	if pa.late {
+		// The caller was already told this was unconfirmed, so closing the channel
+		// would be heard by nobody. Report it instead.
+		if fn := t.onDelivered.Load(); fn != nil {
+			(*fn)(id, pa.dest)
+		}
+		return
+	}
+	close(pa.ch)
 }
 
 // signalAckFrom accepts a direct ack only if it was signed by the expected
@@ -1611,19 +2149,26 @@ func (t *Transfer) sendAck(sourceID string, id [32]byte) {
 	ack := protocol.NewPacket(protocol.PacketTypeAcknowledgement, nil, "", sourceID)
 	ack.ID = id
 	ack.SourceNode = t.selfID
+	// Pad the ack to the same cell boundary as a data fragment. An ack is much
+	// smaller than a fragment, so leaving it unpadded made it the one packet an
+	// observer could classify by size alone — a reliable "this node just received
+	// something" marker, and a starting point for correlation.
+	t.padPacket(ack)
 	ack.Sign(t.signKey)
 	_ = t.sendPooled(peerDialAddr(src), ack)
 }
 
 // dialWithRetries dials addr with the standard retry/backoff, returning nil on
-// failure.
+// failure. Each attempt is bounded by dataDialTimeout, so the whole call is
+// bounded by maxRetries*(dataDialTimeout+retryDelay) rather than by the OS
+// connect timeout.
 func dialWithRetries(addr string) net.Conn {
 	var conn net.Conn
 	var err error
 	for i := 0; i < maxRetries; i++ {
-		conn, err = net.Dial("tcp", addr)
+		conn, err = net.DialTimeout("tcp", addr, dataDialTimeout)
 		if err == nil {
-			return conn
+			return withIOTimeout(conn)
 		}
 		time.Sleep(retryDelay)
 	}
@@ -1645,7 +2190,7 @@ type replyBlock struct {
 // address. Returns nil if no return path with at least one relay can be built
 // (a zero-relay path would expose this node's address to the destination).
 func (t *Transfer) buildReplyBlock(id [32]byte, relays []routing.Peer, ackToken []byte) []byte {
-	if t.nodePriv == nil || t.hopCount < 1 || len(relays) == 0 {
+	if t.nodePriv == nil || !t.wantForward() || len(relays) == 0 {
 		return nil
 	}
 	selfPeer := routing.Peer{
@@ -1654,7 +2199,11 @@ func (t *Transfer) buildReplyBlock(id [32]byte, relays []routing.Peer, ackToken 
 		PubKey:  t.nodePriv.PublicKey().Bytes(),
 		Active:  true,
 	}
-	hops, err := (&routing.Planner{}).BuildPath(selfPeer, relays, t.hopCount)
+	nhops := t.hopsFor(relays, selfPeer.Address)
+	if nhops < 1 {
+		return nil
+	}
+	hops, err := (&routing.Planner{}).BuildPath(selfPeer, relays, nhops)
 	if err != nil || len(hops) < 2 {
 		return nil // need at least one relay before us
 	}
@@ -1710,4 +2259,118 @@ func selfDialHost() string {
 		return a.IP.String()
 	}
 	return "127.0.0.1"
+}
+
+// SetOnDelivered registers a callback invoked when an acknowledgement arrives for
+// a transfer whose send already returned ErrNotConfirmed — the store-and-forward
+// case, where the recipient was offline and acked once redelivered. Pass nil to
+// clear. Safe to call at any time.
+func (t *Transfer) SetOnDelivered(fn func(id [32]byte, destNode string)) {
+	if fn == nil {
+		t.onDelivered.Store(nil)
+		return
+	}
+	t.onDelivered.Store(&fn)
+}
+
+// ackRedundancy is how many times a delivery acknowledgement is emitted, and how
+// far apart. The ack is tiny, and losing it is expensive out of all proportion:
+// the sender waits ackTimeout and then re-sends *every fragment of the whole
+// transfer*, so a lost ~60-byte packet can cost a 256 KiB retransmission, three
+// times over, before the send is reported as unconfirmed even though the data
+// arrived.
+//
+// Duplicating the ack is the cheap fix. Erasure coding it would not help: Reed-
+// Solomon earns its keep by letting any k of n pieces reconstruct a large payload,
+// but an ack fits in a single packet, so the only failure that matters is "this
+// packet was lost" and the answer to that is simply sending it more than once.
+//
+// The copies are spread rather than sent back to back, so a single burst of loss
+// or one momentarily congested queue does not take all of them.
+const (
+	ackRedundancy = 3
+	ackSpread     = 150 * time.Millisecond
+)
+
+// ackWithRedundancy emits the delivery acknowledgement over every return path
+// available for this transfer, several times each.
+//
+// Every available path is used, not the first that matches: a transfer that
+// arrived with a reply block and is also routable has two independent ways home,
+// and using both costs a few hundred bytes while removing a single point of
+// failure. Duplicates are harmless — the first ack to arrive resolves the transfer
+// and the registration is deleted, so later copies find nothing and are dropped.
+func (t *Transfer) ackWithRedundancy(state *transferState) {
+	senders := t.ackSenders(state)
+	if len(senders) == 0 {
+		return
+	}
+
+	for i := 0; i < ackRedundancy; i++ {
+		for _, send := range senders {
+			send()
+		}
+		if i == ackRedundancy-1 {
+			return
+		}
+		select {
+		case <-t.ctx.Done():
+			return
+		case <-time.After(ackSpread):
+		}
+	}
+}
+
+// ackSenders returns one send function per return path available for this
+// transfer. Split out from ackWithRedundancy so path selection — the part with the
+// decision in it — is testable without a network.
+func (t *Transfer) ackSenders(state *transferState) []func() {
+	var senders []func()
+	if len(state.replyBlock) > 0 {
+		rb := state.replyBlock
+		senders = append(senders, func() { t.sendAckReply(rb) })
+	}
+	if state.sourceNode != "" {
+		src, id := state.sourceNode, state.ID
+		switch {
+		case state.routed && t.discovery != nil:
+			senders = append(senders, func() { t.sendRoutedAck(src, id) })
+		case !state.routed:
+			senders = append(senders, func() { t.sendAck(src, id) })
+		}
+	}
+	return senders
+}
+
+// HandleRelayBlobAsync peels a relay blob off the caller's goroutine, bounded by
+// maxConcurrentRelayPeels.
+//
+// The Link receive path delivers a reassembled blob synchronously, from the single
+// goroutine that reads every inbound frame for the whole node. Peeling is cheap,
+// but *forwarding* the remainder is not: the next hop may need a Link dial, which
+// is a full handshake round trip. Doing that inline stalls the node's only reader,
+// so datagrams arriving behind it pile up in the socket buffer until the kernel
+// drops them.
+//
+// That is invisible for a single message and fatal for a burst: a text message
+// worked because nothing was queued behind it, while a file — hundreds of blobs —
+// lost everything after the first and the sender still reported success, because a
+// UDP write cannot fail. Verified end to end: the same transfer went from timing
+// out after 20s to completing in 0.24s.
+//
+// Shedding when saturated is deliberate. Spawning a goroutine per blob without a
+// ceiling would hand anyone who can reach the node an unbounded goroutine and
+// memory multiplier, which is the pattern the security audit removed elsewhere.
+func (t *Transfer) HandleRelayBlobAsync(blob []byte) {
+	select {
+	case t.relaySlots <- struct{}{}:
+	default:
+		t.metrics.IncDropped()
+		t.recordHop(HopDrop, "relay-backlog")
+		return
+	}
+	go func() {
+		defer func() { <-t.relaySlots }()
+		t.handleRelayBlob(blob)
+	}()
 }

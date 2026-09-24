@@ -103,7 +103,10 @@ func (t *Transfer) sendCover() {
 	if err != nil {
 		return
 	}
-	_ = t.sendRelayBlob(hops[0].Address, blob)
+	// Cover traffic must ride the SAME transport as real traffic, or an observer
+	// could tell decoys (TCP) from real onion traffic (Links) and the defense
+	// collapses. sendRelayHop honours OnionOverLinks exactly like a real fragment.
+	_ = t.sendRelayHop(hops[0].NodeID, hops[0].Address, blob)
 }
 
 // buildDecoyInner builds a padded decoy inner packet carrying random bytes.

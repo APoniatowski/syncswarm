@@ -53,7 +53,7 @@ func (t *Transfer) forwardToNextHop(nextNode, nextAddr string, blob []byte) {
 			return
 		}
 	}
-	if err := t.sendRelayBlob(nextAddr, blob); err == nil {
+	if err := t.sendRelayHop(nextNode, nextAddr, blob); err == nil {
 		t.metrics.IncForwarded()
 		t.recordHop(HopForward, nextAddr)
 		return

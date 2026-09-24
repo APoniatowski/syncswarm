@@ -60,7 +60,7 @@ func TestForwardedDeliveryRoundTrip(t *testing.T) {
 	dest := &Transfer{selfID: "dest", sealer: sealer, nodePriv: dpriv, onData: func(b []byte, _ bool) { done <- b }}
 
 	for _, frag := range frags {
-		inner, err := sender.buildInnerFragment(id, "dest", frag, scheme{}, nil)
+		inner, err := sender.buildInnerFragment(id, "dest", "", frag, scheme{}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -91,7 +91,7 @@ func TestForwardedDeliveryRoundTrip(t *testing.T) {
 		}
 		// Inner packets are anonymous/unsigned; the onion peel above already
 		// authenticated the bytes.
-		dest.ingestForwardedFragment(&innerPkt)
+		dest.ingestForwardedFragment(&innerPkt, false)
 	}
 
 	select {
@@ -185,7 +185,7 @@ func TestInnerFragmentIsAnonymous(t *testing.T) {
 	sender := &Transfer{selfID: "sender", signKey: nil}
 	id := sha256.Sum256([]byte("x"))
 	frag := fragment.Fragment{TransferID: id, Index: 0, Total: 1, Payload: []byte("p")}
-	b, err := sender.buildInnerFragment(id, "dest", frag, scheme{}, []byte("rb"))
+	b, err := sender.buildInnerFragment(id, "dest", "", frag, scheme{}, []byte("rb"))
 	if err != nil {
 		t.Fatal(err)
 	}

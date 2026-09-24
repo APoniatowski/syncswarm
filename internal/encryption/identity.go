@@ -26,7 +26,7 @@ func LoadOrCreateIdentity(dir string) (ed25519.PrivateKey, ed25519.PublicKey, er
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil { // holds the private identity seed
 		return nil, nil, err
 	}
 	if err := os.WriteFile(path, priv.Seed(), 0o600); err != nil {

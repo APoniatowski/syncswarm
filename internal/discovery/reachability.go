@@ -12,9 +12,18 @@ import (
 const (
 	reachCheckInterval = 90 * time.Second // how often to re-test reachability
 	reachProbePeers    = 3                // peers asked to dial back per round
-	reachMinResponders = 2                // responders required to declare unreachable
-	reachRoundTimeout  = 4 * time.Second  // wait for dial-back results
-	reachDialTimeout   = 3 * time.Second  // a peer's TCP dial-back timeout
+	reachMinResponders = 2                // responders for an immediate unreachable verdict
+	// reachSoloRounds is how many consecutive rounds a lone responder must report
+	// failure before we accept its verdict. Requiring two responders outright makes
+	// AutoNAT inert in a small swarm — a relay with one peer can never conclude it
+	// is unreachable, so it keeps advertising "relay" while nothing can dial it and
+	// poisons every other node's path selection. Observed live on a two-relay
+	// network. Demanding sustained agreement from the one peer we have keeps the
+	// caution that motivated the threshold (a single transient failure must not
+	// demote a healthy relay) without leaving the mechanism switched off.
+	reachSoloRounds   = 3
+	reachRoundTimeout = 4 * time.Second // wait for dial-back results
+	reachDialTimeout  = 3 * time.Second // a peer's TCP dial-back timeout
 )
 
 // EnableReachabilityChecks turns on AutoNAT: the node periodically asks peers to
@@ -86,10 +95,7 @@ func (d *Discovery) checkReachability() {
 		}
 	}
 
-	if !reachable && responses < reachMinResponders {
-		return // inconclusive
-	}
-	d.setReachable(reachable)
+	d.concludeRound(responses, reachable)
 }
 
 // probeTargets returns up to n dialable UDP addresses of active peers.
@@ -173,5 +179,30 @@ func (d *Discovery) sendReachability(addr *net.UDPAddr, typ protocol.PacketType,
 	packet.Sign(d.signPriv)
 	if packetBytes, err := packet.MarshalBinary(); err == nil {
 		d.iface.Send(addr.String(), packetBytes)
+	}
+}
+
+// concludeRound turns one round's tally into a verdict, or leaves the current one
+// standing when the evidence is too thin. Split out so the decision rule is
+// testable without sockets.
+func (d *Discovery) concludeRound(responses int, reachable bool) {
+	if reachable {
+		d.soloFailures = 0
+		d.setReachable(true)
+		return
+	}
+	if responses >= reachMinResponders {
+		d.soloFailures = 0
+		d.setReachable(false)
+		return
+	}
+	if responses == 0 {
+		return // nobody answered: says nothing either way
+	}
+	// A single responder reporting failure. Accept it only once it has said so
+	// consistently, so one flaky peer cannot demote a healthy relay.
+	d.soloFailures++
+	if d.soloFailures >= reachSoloRounds {
+		d.setReachable(false)
 	}
 }
